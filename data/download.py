@@ -17,6 +17,11 @@ import yfinance as yf
 # -----------------------------------------------------------------------------
 
 TICKERS: list[str] = ["JPM", "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS"]
+# Broad-market benchmarks for cross-asset EDA (Yahoo symbol → filename stem in data/raw/)
+BENCHMARK_INDICES: list[tuple[str, str]] = [
+    ("^NSEI", "NIFTY50"),  # NIFTY 50
+    ("^GSPC", "SP500"),  # S&P 500
+]
 START_DATE = "2015-01-01"
 END_DATE = "2026-01-01"
 RAW_DIR = Path(__file__).resolve().parent / "raw"
@@ -147,6 +152,25 @@ def raw_csv_path(ticker: str, out_dir: Path) -> Path:
     """
     safe = ticker.replace(".", "_")
     return out_dir / f"{safe}_raw.csv"
+
+
+def raw_csv_path_for_stem(file_stem: str, out_dir: Path) -> Path:
+    """
+    Path for a raw CSV using an explicit filename stem (e.g. NIFTY50, SP500).
+
+    Parameters
+    ----------
+    file_stem : str
+        Safe stem without ``_raw.csv`` suffix.
+    out_dir : Path
+        Directory for raw files.
+
+    Returns
+    -------
+    Path
+        Full output path.
+    """
+    return out_dir / f"{file_stem}_raw.csv"
 
 
 # -----------------------------------------------------------------------------
@@ -305,9 +329,10 @@ def main() -> None:
     """Download all configured tickers, print diagnostics, save CSVs, print summary."""
     print_section_title("RAMT — data download & first-look diagnostics")
     print(
-        f"\n  Tickers : {', '.join(TICKERS)}\n"
-        f"  Period  : {START_DATE}  →  {END_DATE}  (end exclusive)\n"
-        f"  Output  : {RAW_DIR}"
+        f"\n  Stocks   : {', '.join(TICKERS)}\n"
+        f"  Indices  : {', '.join(f'{sym} → {stem}_raw.csv' for sym, stem in BENCHMARK_INDICES)}\n"
+        f"  Period   : {START_DATE}  →  {END_DATE}  (end exclusive)\n"
+        f"  Output   : {RAW_DIR}"
     )
 
     summary_rows: list[dict[str, object]] = []
@@ -338,6 +363,42 @@ def main() -> None:
         summary_rows.append(
             {
                 "Ticker": ticker,
+                "Rows": len(df),
+                "Start": pd.Timestamp(df["Date"].min()).date(),
+                "End": pd.Timestamp(df["Date"].max()).date(),
+                "Total_NaNs": total_nans,
+                "LR_Kurtosis": pk,
+            }
+        )
+
+    print_section_title("Benchmark indices (NIFTY 50 & S&P 500)")
+    for yahoo_sym, file_stem in BENCHMARK_INDICES:
+        df = download_one_ticker(yahoo_sym, START_DATE, END_DATE)
+        label = f"{yahoo_sym} ({file_stem})"
+        print_ticker_diagnostics(label, df)
+
+        if df.empty:
+            summary_rows.append(
+                {
+                    "Ticker": yahoo_sym,
+                    "Rows": None,
+                    "Start": None,
+                    "End": None,
+                    "Total_NaNs": None,
+                    "LR_Kurtosis": None,
+                }
+            )
+            continue
+
+        out_path = raw_csv_path_for_stem(file_stem, RAW_DIR)
+        save_ticker_csv(df, out_path)
+        print(f"\n  Saved → {out_path.resolve()}")
+
+        total_nans = int(df.isna().sum().sum())
+        pk = pearson_kurtosis(df["Log_Return"])
+        summary_rows.append(
+            {
+                "Ticker": yahoo_sym,
                 "Rows": len(df),
                 "Start": pd.Timestamp(df["Date"].min()).date(),
                 "End": pd.Timestamp(df["Date"].max()).date(),

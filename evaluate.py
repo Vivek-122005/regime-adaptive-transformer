@@ -41,7 +41,7 @@ def main() -> None:
     p.add_argument(
         "--data",
         type=Path,
-        default=ROOT / "data" / "raw" / "SPY.csv",
+        default=ROOT / "data" / "raw" / "JPM_raw.csv",
     )
     p.add_argument(
         "--checkpoint",

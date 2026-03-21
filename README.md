@@ -32,17 +32,15 @@ pip install -r requirements.txt
 
 ### Fetch data
 
+RAMT default tickers (JPM, Indian ADR-style NSE names) with diagnostics and `*_raw.csv` for EDA:
+
 ```bash
-python data/download.py --tickers SPY --start 2015-01-01 --end 2024-12-31
+python data/download.py
 ```
 
 ### Train
 
-```bash
-python train.py --model ramt --epochs 30 --batch-size 64
-python train.py --model xgboost
-python train.py --model lstm --epochs 30
-```
+Training script in progress — baseline models available in `models/baseline_xgboost.py` and `models/baseline_lstm.py`.
 
 ### Evaluate
 
@@ -54,14 +52,20 @@ python evaluate.py --checkpoint checkpoints/xgboost.joblib
 
 ### EDA
 
-Open `eda/eda_notebook.ipynb` in Jupyter.
+```bash
+jupyter notebook eda/eda.ipynb
+```
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `data/download.py` | Yahoo Finance download |
+| `data/download.py` | Yahoo Finance: `--ramt` or generic `--tickers` |
+| `data/raw/` | Downloaded CSV (gitignored except structure) |
+| `data/processed/` | Optional derived tables / parquet |
+| `eda/eda_notebook.ipynb` | Exploratory plots on RAMT `*_raw.csv` |
 | `features/feature_engineering.py` | Windows, scaling, labels |
 | `models/baseline_*.py` | XGBoost / LSTM |
 | `models/ramt/` | Encoder, MoE, full RAMT |
 | `train.py` / `evaluate.py` | CLI training and metrics |
+| `checkpoints/` | Saved models (artifacts gitignored) |
