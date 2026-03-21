@@ -1,7 +1,9 @@
 """
-RAMT — feature engineering from raw OHLCV to enriched feature matrices.
-
-Run from project root: python features/feature_engineering.py
+RAMT Data Pipeline — Step 2: Feature Engineering
+Transforms raw OHLCV data into a 36-feature matrix per ticker.
+Feature groups: lagged returns, volatility, technical indicators,
+momentum, volume, HMM regime labels, cross-asset correlation.
+Saves processed CSVs to data/processed/.
 """
 
 from __future__ import annotations
@@ -17,7 +19,9 @@ from hmmlearn.hmm import GaussianHMM
 # Paths & raw file mapping
 # -----------------------------------------------------------------------------
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path.cwd()
+if not (PROJECT_ROOT / "data" / "raw").exists():
+    PROJECT_ROOT = PROJECT_ROOT.parent
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
@@ -400,6 +404,4 @@ def main() -> None:
         enriched.to_csv(out_path, index=False)
         print(f"Saved: {out_path}")
 
-
-if __name__ == "__main__":
-    main()
+main()

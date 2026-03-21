@@ -1,7 +1,8 @@
 """
-RAMT (Regime-Adaptive Multimodal Transformer) — equity data download and diagnostics.
-
-Run: python data/download.py
+RAMT Data Pipeline — Step 1: Download
+Downloads OHLCV data for JPM, RELIANCE.NS, TCS.NS, HDFCBANK.NS
+and benchmark indices (NIFTY50, S&P500) from 2010-01-01 to 2026-01-01.
+Saves raw CSVs to data/raw/.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ BENCHMARK_INDICES: list[tuple[str, str]] = [
     ("^NSEI", "NIFTY50"),  # NIFTY 50
     ("^GSPC", "SP500"),  # S&P 500
 ]
-START_DATE = "2015-01-01"
+START_DATE = "2010-01-01"
 END_DATE = "2026-01-01"
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]

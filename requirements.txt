@@ -7,7 +7,7 @@ yfinance>=0.2.40
 hmmlearn>=0.3.0
 scikit-learn>=1.3.0
 torch>=2.1.0
-xgboost>=2.0.0
+xgboost>=1.7.0
 
 # EDA / notebooks
 matplotlib>=3.7.0

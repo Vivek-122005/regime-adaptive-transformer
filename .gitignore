@@ -1,15 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
 .venv/
 venv/
-__pycache__/
-*.py[cod]
+env/
 *.egg-info/
-.pytest_cache/
-.mypy_cache/
-.DS_Store
-.ipynb_checkpoints/
+
+# Data (too large for git)
 data/raw/*.csv
-data/processed/*.parquet
-*.pt
-*.joblib
-wandb/
-lightning_logs/
+data/processed/*.csv
+results/*.csv
+
+# Models
+checkpoints/*.pt
+checkpoints/*.joblib
+!checkpoints/.gitkeep
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
