@@ -49,6 +49,9 @@ INITIAL_TRAIN_FRAC = 0.6
 STEP_DAYS = 63
 TEST_DAYS = 63
 VAL_FRAC_WITHIN_TRAIN = 0.2
+MIN_REGIME_SAMPLES = 50
+TOP_N_FEATURES = 15
+REGIME_CODES = (0, 1, 2)
 
 XGB_PARAMS = dict(
     n_estimators=500,
@@ -63,7 +66,7 @@ XGB_PARAMS = dict(
 )
 
 
-def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
+def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series, pd.Series]:
     """Target = next-day log return; align rows where y is defined."""
     df = df.sort_values("Date").reset_index(drop=True)
     y = df["Log_Return"].shift(-1)
@@ -71,22 +74,103 @@ def prepare_xy(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.Series, pd.Series]:
     df = df.loc[valid].reset_index(drop=True)
     y = y.loc[valid].reset_index(drop=True)
     dates = df["Date"]
+    regime = df["HMM_Regime"].fillna(-1).astype(int)
     feat_cols = [c for c in df.columns if c not in EXCLUDE_FROM_X]
     X = df[feat_cols]
-    return X, y, dates
+    return X, y, dates, regime
+
+
+def compute_sample_weights(y: pd.Series) -> np.ndarray:
+    """1.5x weight when |y| > 1 std of y; else 1.0."""
+    ys = y.to_numpy(dtype=float)
+    std = float(np.std(ys, ddof=0))
+    if std == 0.0 or not np.isfinite(std):
+        return np.ones(len(ys), dtype=float)
+    return np.where(np.abs(ys) > std, 1.5, 1.0).astype(float)
+
+
+def select_top_features(
+    X: pd.DataFrame,
+    y: pd.Series,
+    n0: int,
+) -> list[str]:
+    """Fit on initial window (with same train/val split as folds) and return top n feature names."""
+    n_val = max(1, int(np.ceil(VAL_FRAC_WITHIN_TRAIN * n0)))
+    n_fit = n0 - n_val
+    if n_fit < 10:
+        raise ValueError("Initial window too small for feature selection")
+    X_init = X.iloc[:n0]
+    y_init = y.iloc[:n0]
+    X_fit = X_init.iloc[:n_fit]
+    y_fit = y_init.iloc[:n_fit]
+    X_val = X_init.iloc[n_fit:]
+    y_val = y_init.iloc[n_fit:]
+    w_fit = compute_sample_weights(y_fit)
+    fs_model = XGBRegressor(**XGB_PARAMS)
+    fs_model.fit(
+        X_fit,
+        y_fit,
+        sample_weight=w_fit,
+        eval_set=[(X_val, y_val)],
+        verbose=False,
+    )
+    names = list(X_fit.columns)
+    imp = fs_model.feature_importances_
+    order = np.argsort(imp)[::-1][:TOP_N_FEATURES]
+    return [names[i] for i in order]
+
+
+def cols_without_regime(selected: list[str]) -> list[str]:
+    return [c for c in selected if c != "HMM_Regime"]
+
+
+def _fit_regime_model(
+    X_fit_r: pd.DataFrame,
+    y_fit_r: pd.Series,
+    X_val_r: pd.DataFrame,
+    y_val_r: pd.Series,
+) -> XGBRegressor:
+    w_fit_r = compute_sample_weights(y_fit_r)
+    model = XGBRegressor(**XGB_PARAMS)
+    if len(X_val_r) >= 1:
+        model.fit(
+            X_fit_r,
+            y_fit_r,
+            sample_weight=w_fit_r,
+            eval_set=[(X_val_r, y_val_r)],
+            verbose=False,
+        )
+    else:
+        nvr = len(X_fit_r)
+        if nvr < 20:
+            model.fit(X_fit_r, y_fit_r, sample_weight=w_fit_r, verbose=False)
+        else:
+            nv2 = max(1, int(np.ceil(0.2 * nvr)))
+            model.fit(
+                X_fit_r.iloc[:-nv2],
+                y_fit_r.iloc[:-nv2],
+                sample_weight=w_fit_r[:-nv2],
+                eval_set=[(X_fit_r.iloc[-nv2:], y_fit_r.iloc[-nv2:])],
+                verbose=False,
+            )
+    return model
 
 
 def walk_forward_predict(
     X: pd.DataFrame,
     y: pd.Series,
     dates: pd.Series,
+    regime: pd.Series,
     ticker: str,
+    selected_features: list[str],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Expanding window: first train ends at INITIAL_TRAIN_FRAC * n; each step adds
-    TEST_DAYS to the training end. No test rows appear in training for that fold.
-    Returns parallel arrays: date, y_true, y_pred for all OOS test rows.
+    Expanding window with regime-stratified models per fold: train up to 3
+    XGBRegressors (HMM regimes 0,1,2) plus a global fallback; route test
+    predictions by row regime when the regime had >= MIN_REGIME_SAMPLES train rows.
     """
+    cols_no_reg = cols_without_regime(selected_features)
+
     n = len(X)
     n0 = int(n * INITIAL_TRAIN_FRAC)
     if n0 < 50 or n0 + TEST_DAYS > n:
@@ -103,6 +187,7 @@ def walk_forward_predict(
 
         X_tr = X.iloc[:train_end]
         y_tr = y.iloc[:train_end]
+        regime_tr = regime.iloc[:train_end]
 
         n_tr = len(X_tr)
         n_val = max(1, int(np.ceil(VAL_FRAC_WITHIN_TRAIN * n_tr)))
@@ -114,23 +199,52 @@ def walk_forward_predict(
         y_fit = y_tr.iloc[:n_fit]
         X_val = X_tr.iloc[n_fit:]
         y_val = y_tr.iloc[n_fit:]
+        regime_fit = regime_tr.iloc[:n_fit]
+        regime_val = regime_tr.iloc[n_fit:]
+
+        w_fit = compute_sample_weights(y_fit)
+        global_model = XGBRegressor(**XGB_PARAMS)
+        global_model.fit(
+            X_fit,
+            y_fit,
+            sample_weight=w_fit,
+            eval_set=[(X_val, y_val)],
+            verbose=False,
+        )
+
+        regime_models: dict[int, XGBRegressor] = {}
+        use_regime: dict[int, bool] = {r: False for r in REGIME_CODES}
+
+        for r in REGIME_CODES:
+            mask_fit = regime_fit == r
+            n_r = int(mask_fit.sum())
+            if n_r < MIN_REGIME_SAMPLES:
+                continue
+            X_fit_r = X_fit.loc[mask_fit, cols_no_reg]
+            y_fit_r = y_fit.loc[mask_fit]
+            mask_val = regime_val == r
+            X_val_r = X_val.loc[mask_val, cols_no_reg]
+            y_val_r = y_val.loc[mask_val]
+            regime_models[r] = _fit_regime_model(X_fit_r, y_fit_r, X_val_r, y_val_r)
+            use_regime[r] = True
 
         X_te = X.iloc[test_start:test_end]
         y_te = y.iloc[test_start:test_end]
         d_te = dates.iloc[test_start:test_end]
+        regime_te = regime.iloc[test_start:test_end]
 
-        model = XGBRegressor(**XGB_PARAMS)
-        model.fit(
-            X_fit,
-            y_fit,
-            eval_set=[(X_val, y_val)],
-            verbose=False,
-        )
-        pred = model.predict(X_te)
+        preds: list[float] = []
+        for j in range(len(X_te)):
+            r_i = int(regime_te.iloc[j])
+            row = X_te.iloc[j : j + 1]
+            if r_i in use_regime and use_regime[r_i]:
+                preds.append(float(regime_models[r_i].predict(row[cols_no_reg])[0]))
+            else:
+                preds.append(float(global_model.predict(row[selected_features])[0]))
 
         oos_dates.extend(d_te.tolist())
         oos_y_true.extend(y_te.to_numpy().tolist())
-        oos_y_pred.extend(pred.tolist())
+        oos_y_pred.extend(preds)
 
         train_end += TEST_DAYS
 
@@ -156,10 +270,15 @@ def directional_accuracy_pct(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def sharpe_ratio(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    strat = y_true * np.sign(y_pred)
+    """Soft position: y_pred scaled by rolling std of predictions, clipped to [-2, 2]."""
+    y_pred_s = pd.Series(y_pred, dtype=float)
+    roll_std = y_pred_s.rolling(20, min_periods=1).std()
+    pos = y_pred_s / roll_std.replace(0.0, np.nan)
+    pos = pos.clip(-2.0, 2.0).fillna(0.0)
+    strat = y_true * pos.to_numpy()
     mu = float(np.mean(strat))
     sig = float(np.std(strat, ddof=0))
-    if sig == 0.0:
+    if sig == 0.0 or not np.isfinite(sig):
         return float("nan")
     return mu / sig * np.sqrt(252.0)
 
@@ -169,6 +288,7 @@ def main() -> None:
 
     all_rows: list[dict] = []
     metrics_rows: list[tuple[str, float, float, float, float]] = []
+    top_features_by_ticker: dict[str, list[str]] = {}
 
     for ticker, fname in FEATURE_FILES:
         path = PROCESSED_DIR / fname
@@ -176,9 +296,16 @@ def main() -> None:
             raise FileNotFoundError(path)
 
         raw = pd.read_csv(path, parse_dates=["Date"])
-        X, y, dates = prepare_xy(raw)
+        X, y, dates, regime = prepare_xy(raw)
+        n = len(X)
+        n0 = int(n * INITIAL_TRAIN_FRAC)
+        selected = select_top_features(X, y, n0)
+        top_features_by_ticker[ticker] = selected
+        X = X[selected]
 
-        dates_oos, y_true, y_pred = walk_forward_predict(X, y, dates, ticker)
+        dates_oos, y_true, y_pred = walk_forward_predict(
+            X, y, dates, regime, ticker, selected
+        )
 
         r = rmse(y_true, y_pred)
         m = mae(y_true, y_pred)
@@ -204,6 +331,7 @@ def main() -> None:
     print()
     print(f"Saved predictions → {out_path.resolve()}")
     print()
+    print("Table 1 — Regime-stratified results:")
     print("Ticker       | RMSE   | MAE    | DA%   | Sharpe")
     print("-------------|--------|--------|-------|-------")
 
@@ -229,6 +357,18 @@ def main() -> None:
     print(
         f"{'Average':<12} | {avg_r:.4f} | {avg_m:.4f} | {avg_da:>5.2f} | {avg_sh_str}"
     )
+    print()
+    print("Table 2 — Top 5 features per ticker:")
+    w = 22
+    hdr = " | ".join([f"{'Rank ' + str(i + 1):<{w}}" for i in range(5)])
+    print(f"{'Ticker':<12} | {hdr}")
+    print("-" * 12 + "-+-" + "-+-".join(["-" * w] * 5))
+    for ticker, _fname in FEATURE_FILES:
+        feats = top_features_by_ticker[ticker][:5]
+        while len(feats) < 5:
+            feats.append("")
+        cols = [f"{f:<{w}}" for f in feats]
+        print(f"{ticker:<12} | " + " | ".join(cols))
     print()
 
 
