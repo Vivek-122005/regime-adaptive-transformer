@@ -3,8 +3,8 @@ import os
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.preprocessing import StandardScaler
 from torch.utils.data import DataLoader, Dataset
+from sklearn.preprocessing import StandardScaler
 
 PRICE_COLS = [
     "Return_Lag_1",
@@ -60,9 +60,9 @@ class SequenceDataset(Dataset):
     """
     Creates overlapping sequences of length seq_len from
     a numpy feature array. Each sample is:
-      X: (seq_len, num_features) -- input sequence
-      y: scalar -- next day log return (target)
-      regime: integer -- HMM_Regime at last timestep
+      X: (seq_len, num_features) — input sequence
+      y: scalar — next day log return (target)
+      regime: integer — HMM_Regime at last timestep
     """
 
     def __init__(self, features, targets, regimes, seq_len=30):
@@ -97,7 +97,13 @@ class RAMTDataModule:
     data only and applied to val/test. Zero leakage.
     """
 
-    def __init__(self, ticker, data_dir="data/processed", seq_len=30, batch_size=32):
+    def __init__(
+        self,
+        ticker,
+        data_dir="data/processed",
+        seq_len=30,
+        batch_size=32,
+    ):
         self.ticker = ticker
         self.seq_len = seq_len
         self.batch_size = batch_size
