@@ -25,4 +25,44 @@ Encoders exist so downstream parts of the model (fusion, attention, prediction h
 
 ---
 
+## What the RAMT dataset module does (`dataset.py`)
+
+The RAMT data path is built around **one ticker**, **processed CSV features**, **sequences for a transformer**, and **walk-forward evaluation** without scaler leakage.
+
+### Column constants
+
+`PRICE_COLS`, `VOL_COLS`, `TECH_COLS`, `MOMENTUM_COLS`, `VOLUME_COLS`, `REGIME_COLS`, `CROSS_ASSET_COLS` are concatenated into **`ALL_FEATURE_COLS`** (27 features in a fixed order). The encoder and any model code should use this order so column indices stay consistent.
+
+### Loading (`RAMTDataModule._load_data`)
+
+- Reads `data/processed/{ticker}_features.csv`.
+- **Target:** next trading day’s return: `target = Log_Return.shift(-1)`, then rows with missing target are dropped.
+- Checks that every column in `ALL_FEATURE_COLS` exists.
+- Keeps **raw** feature matrix `features_raw`, **targets** `targets`, and per-row **integer** `HMM_Regime` in `regimes` (used as labels; the same regime column also appears inside scaled `X` for the multimodal encoder).
+
+### Scaling (per fold, in `get_fold_loaders`)
+
+- **Train** indices are split into **actual train** and **validation** (last `val_fraction` of the train window, at least one row).
+- **`StandardScaler` is fit only on actual-train rows**, then applied to val and test. Val/test never influence mean/variance — **no leakage** from future or held-out segments into normalization.
+
+### Sequences (`SequenceDataset`)
+
+- For each valid time index `i ≥ seq_len`, one sample is:
+  - **`X`:** `seq_len` consecutive rows of scaled features ending **before** the target day → shape `(seq_len, 27)`.
+  - **`y`:** scalar next-day target at index `i`.
+  - **`regime`:** `HMM_Regime` at that same index `i` (integer), returned as a length-1 tensor for batching.
+
+So the model sees a **history window** and predicts **one step ahead**, with an explicit regime label aligned to the prediction time.
+
+### Walk-forward folds (`get_walk_forward_indices`)
+
+- Starts with an initial training fraction of the series (default 60%), then repeatedly extends the train end and takes a fixed-length **test** block (default 63 days), sliding forward until the end of the data.
+- Each fold is `(train_idx, test_idx)`; you call **`get_fold_loaders(train_idx, test_idx)`** to get `train_loader`, `val_loader`, `test_loader`, plus **`test_dates`** for the test segment (aligned to sequence-valid test positions).
+
+### What you get out
+
+**PyTorch `DataLoader`s** yielding batches of `(X, y, regime)` for training RAMT with **expanding training history**, **held-out forward chunks**, and **honest scaling** per fold.
+
+---
+
 <!-- New sections go below this line -->
