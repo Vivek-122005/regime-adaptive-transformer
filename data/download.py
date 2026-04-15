@@ -18,25 +18,86 @@ import yfinance as yf
 # Configuration
 # -----------------------------------------------------------------------------
 
-TICKERS: list[str] = [
-    "JPM",
-    "RELIANCE.NS",
+# NIFTY 50 universe (Yahoo Finance tickers)
+NIFTY_50_TICKERS: list[str] = [
+    # IT
     "TCS.NS",
+    "INFY.NS",
+    "WIPRO.NS",
+    "HCLTECH.NS",
+    "TECHM.NS",
+    # Banking
     "HDFCBANK.NS",
-    "EPIGRAL.NS",  # Epigral Limited (NSE); ~10-year window via TICKER_DATE_OVERRIDES
+    "ICICIBANK.NS",
+    "KOTAKBANK.NS",
+    "AXISBANK.NS",
+    "SBIN.NS",
+    # Financial
+    "BAJFINANCE.NS",
+    "BAJAJFINSV.NS",
+    "HDFC.NS",
+    # Energy
+    "RELIANCE.NS",
+    "ONGC.NS",
+    "POWERGRID.NS",
+    "NTPC.NS",
+    # Consumer
+    "HINDUNILVR.NS",
+    "ITC.NS",
+    "NESTLEIND.NS",
+    "BRITANNIA.NS",
+    # Auto
+    "MARUTI.NS",
+    "TATAMOTORS.NS",
+    "EICHERMOT.NS",
+    "HEROMOTOCO.NS",
+    # Pharma
+    "SUNPHARMA.NS",
+    "DRREDDY.NS",
+    "CIPLA.NS",
+    "DIVISLAB.NS",
+    # Metals
+    "TATASTEEL.NS",
+    "HINDALCO.NS",
+    "JSWSTEEL.NS",
+    "COALINDIA.NS",
+    # Telecom
+    "BHARTIARTL.NS",
+    # Cement
+    "ULTRACEMCO.NS",
+    "GRASIM.NS",
+    "SHREECEM.NS",
+    # Others
+    "ADANIENT.NS",
+    "ADANIPORTS.NS",
+    "BAJAJ-AUTO.NS",
+    "BPCL.NS",
+    "DMART.NS",
+    "INDUSINDBK.NS",
+    "LT.NS",
+    "M&M.NS",
+    "TITAN.NS",
+    "UPL.NS",
+    "VEDL.NS",
+    "WIPRO.NS",
+    "ASIANPAINT.NS",
+    # Benchmark
+    "^NSEI",  # NIFTY 50 index
 ]
-# Broad-market benchmarks for cross-asset EDA (Yahoo symbol → filename stem in data/raw/)
-BENCHMARK_INDICES: list[tuple[str, str]] = [
-    ("^NSEI", "NIFTY50"),  # NIFTY 50
-    ("^GSPC", "SP500"),  # S&P 500
-]
-START_DATE = "2010-01-01"
-END_DATE = "2026-01-01"
-# Per-symbol date range (others use START_DATE / END_DATE). Epigral: last 10 years only.
-_EPIGRAL_START = (pd.Timestamp(END_DATE) - pd.DateOffset(years=10)).strftime("%Y-%m-%d")
-TICKER_DATE_OVERRIDES: dict[str, tuple[str, str]] = {
-    "EPIGRAL.NS": (_EPIGRAL_START, END_DATE),
+
+# Macro series (saved as data/raw/macro_{NAME}_raw.csv)
+MACRO_TICKERS: dict[str, str] = {
+    "USDINR": "USDINR=X",
+    "CRUDE": "CL=F",
+    "GOLD": "GC=F",
+    "USVIX": "^VIX",
 }
+
+START_DATE = "2015-01-01"
+END_DATE = "2026-01-01"
+
+TICKERS: list[str] = NIFTY_50_TICKERS
+TICKER_DATE_OVERRIDES: dict[str, tuple[str, str]] = {}
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
 
@@ -163,7 +224,7 @@ def raw_csv_path(ticker: str, out_dir: Path) -> Path:
     Path
         Full output path.
     """
-    safe = ticker.replace(".", "_")
+    safe = ticker.replace(".", "_").replace("^", "_")
     return out_dir / f"{safe}_raw.csv"
 
 
@@ -342,8 +403,8 @@ def main() -> None:
     """Download all configured tickers, print diagnostics, save CSVs, print summary."""
     print_section_title("RAMT — data download & first-look diagnostics")
     print(
-        f"\n  Stocks   : {', '.join(TICKERS)}\n"
-        f"  Indices  : {', '.join(f'{sym} → {stem}_raw.csv' for sym, stem in BENCHMARK_INDICES)}\n"
+        f"\n  Tickers  : {', '.join(TICKERS)}\n"
+        f"  Macro    : {', '.join(f'{k}={v}' for k, v in MACRO_TICKERS.items())}\n"
         f"  Period   : {START_DATE}  →  {END_DATE}  (end exclusive)\n"
         f"  Output   : {RAW_DIR}"
     )
@@ -385,16 +446,16 @@ def main() -> None:
             }
         )
 
-    print_section_title("Benchmark indices (NIFTY 50 & S&P 500)")
-    for yahoo_sym, file_stem in BENCHMARK_INDICES:
+    print_section_title("Macro series")
+    for name, yahoo_sym in MACRO_TICKERS.items():
         df = download_one_ticker(yahoo_sym, START_DATE, END_DATE)
-        label = f"{yahoo_sym} ({file_stem})"
+        label = f"{name} ({yahoo_sym})"
         print_ticker_diagnostics(label, df)
 
         if df.empty:
             summary_rows.append(
                 {
-                    "Ticker": yahoo_sym,
+                    "Ticker": f"macro_{name}",
                     "Rows": None,
                     "Start": None,
                     "End": None,
@@ -404,7 +465,7 @@ def main() -> None:
             )
             continue
 
-        out_path = raw_csv_path_for_stem(file_stem, RAW_DIR)
+        out_path = raw_csv_path_for_stem(f"macro_{name}", RAW_DIR)
         save_ticker_csv(df, out_path)
         print(f"\n  Saved → {out_path.resolve()}")
 
@@ -412,7 +473,7 @@ def main() -> None:
         pk = pearson_kurtosis(df["Log_Return"])
         summary_rows.append(
             {
-                "Ticker": yahoo_sym,
+                "Ticker": f"macro_{name}",
                 "Rows": len(df),
                 "Start": pd.Timestamp(df["Date"].min()).date(),
                 "End": pd.Timestamp(df["Date"].max()).date(),

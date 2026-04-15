@@ -102,7 +102,7 @@ class RAMTModel(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, x, regime):
+    def forward(self, x, regime, ticker_id=None):
         """
         Full RAMT forward pass.
 
@@ -116,7 +116,7 @@ class RAMTModel(nn.Module):
         """
         # Step 1: Encode each feature group separately
         # then fuse into unified representation
-        encoded = self.encoder(x)
+        encoded = self.encoder(x, ticker_id=ticker_id)
         # encoded: (batch, seq_len, embed_dim=64)
 
         # Step 2: Add positional information

@@ -1,10 +1,43 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import StandardScaler
+
+def _ticker_from_processed_filename(name: str) -> str:
+    stem = Path(name).stem
+    if stem.endswith("_features"):
+        stem = stem[: -len("_features")]
+    return stem
+
+
+def build_ticker_universe(processed_dir: str = "data/processed") -> list[str]:
+    """
+    Build the cross-stock training universe from processed feature files.
+
+    We intentionally exclude benchmark / non-universe symbols.
+    """
+    pdir = Path(processed_dir)
+    if not pdir.exists():
+        return []
+
+    exclude = {"NIFTY50", "SP500", "JPM"}
+    tickers: list[str] = []
+    for p in sorted(pdir.glob("*_features.csv")):
+        t = _ticker_from_processed_filename(p.name)
+        if t in exclude:
+            continue
+        tickers.append(t)
+    return tickers
+
+
+# Stable ticker universe for embeddings / cross-stock training.
+# If processed files exist, derive it from disk; else fall back to a minimal list.
+TICKER_LIST = build_ticker_universe() or ["TCS_NS"]
+TICKER_TO_ID = {t: i for i, t in enumerate(TICKER_LIST)}
 
 PRICE_COLS = [
     "Return_Lag_1",
@@ -42,6 +75,27 @@ REGIME_COLS = ["HMM_Regime"]
 
 CROSS_ASSET_COLS = ["Rolling_Corr_Index"]
 
+RELATIVE_MOM_COLS = [
+    "RelMom_5d",
+    "RelMom_21d",
+    "RelMom_63d",
+    "RelMom_126d",
+    "RelMom_252d",
+    "Mom_12_1",
+    "RelMom_12_1",
+]
+
+MACRO_COLS = [
+    "Macro_USDINR_Ret1d",
+    "Macro_USDINR_Ret5d",
+    "Macro_CRUDE_Ret1d",
+    "Macro_CRUDE_Ret5d",
+    "Macro_GOLD_Ret1d",
+    "Macro_GOLD_Ret5d",
+    "Macro_USVIX_Ret1d",
+    "Macro_USVIX_Ret5d",
+]
+
 ALL_FEATURE_COLS = (
     PRICE_COLS
     + VOL_COLS
@@ -50,10 +104,12 @@ ALL_FEATURE_COLS = (
     + VOLUME_COLS
     + REGIME_COLS
     + CROSS_ASSET_COLS
+    + RELATIVE_MOM_COLS
+    + MACRO_COLS
 )
-# Total: 27 columns
+# Total: 42 columns
 
-TARGET_COL = "Log_Return"
+TARGET_COL = "Monthly_Alpha"  # was "Log_Return"
 
 
 class SequenceDataset(Dataset):
@@ -65,11 +121,12 @@ class SequenceDataset(Dataset):
       regime: integer — HMM_Regime at last timestep
     """
 
-    def __init__(self, features, targets, regimes, seq_len=30):
+    def __init__(self, features, targets, regimes, seq_len=30, ticker_id=None):
         self.features = features  # numpy (N, num_features)
         self.targets = targets  # numpy (N,)
         self.regimes = regimes  # numpy (N,) integers
         self.seq_len = seq_len
+        self.ticker_id = ticker_id
         # Valid indices: need seq_len rows before each target
         self.valid_idx = list(range(seq_len, len(targets)))
 
@@ -81,11 +138,14 @@ class SequenceDataset(Dataset):
         X = self.features[i - self.seq_len : i]  # (seq_len, features)
         y = self.targets[i]  # scalar
         regime = self.regimes[i]  # integer
-        return (
+        batch = (
             torch.FloatTensor(X),
             torch.FloatTensor([y]),
             torch.LongTensor([regime]),
         )
+        if self.ticker_id is None:
+            return batch
+        return batch + (torch.LongTensor([int(self.ticker_id)]),)
 
 
 class RAMTDataModule:
@@ -112,15 +172,18 @@ class RAMTDataModule:
         self.features = None
         self.targets = None
         self.regimes = None
+        self.ticker_id = None  # set externally
         self._load_data(data_dir)
 
     def _load_data(self, data_dir):
         """Load CSV, compute target, extract feature arrays."""
         path = os.path.join(data_dir, f"{self.ticker}_features.csv")
-        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        df = pd.read_csv(path, parse_dates=["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+        df = df.set_index("Date", drop=True)
 
-        # Target: next day log return
-        df["target"] = df[TARGET_COL].shift(-1)
+        # Target: Monthly_Alpha already encodes forward 21d alpha
+        df["target"] = df[TARGET_COL]
         df = df.dropna(subset=["target"])
 
         # Verify all feature columns exist
@@ -178,9 +241,13 @@ class RAMTDataModule:
         X_test_sc = self.scaler.transform(X_test)
 
         # Create datasets
-        train_ds = SequenceDataset(X_train_sc, y_train, r_train, self.seq_len)
-        val_ds = SequenceDataset(X_val_sc, y_val, r_val, self.seq_len)
-        test_ds = SequenceDataset(X_test_sc, y_test, r_test, self.seq_len)
+        train_ds = SequenceDataset(
+            X_train_sc, y_train, r_train, self.seq_len, ticker_id=self.ticker_id
+        )
+        val_ds = SequenceDataset(X_val_sc, y_val, r_val, self.seq_len, ticker_id=self.ticker_id)
+        test_ds = SequenceDataset(
+            X_test_sc, y_test, r_test, self.seq_len, ticker_id=self.ticker_id
+        )
 
         # DataLoaders
         train_loader = DataLoader(

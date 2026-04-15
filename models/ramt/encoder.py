@@ -8,6 +8,7 @@ from models.ramt.dataset import (
     PRICE_COLS,
     REGIME_COLS,
     TECH_COLS,
+    TICKER_LIST,
     VOL_COLS,
     VOLUME_COLS,
 )
@@ -80,6 +81,37 @@ class RegimeEncoder(nn.Module):
         return self.norm(embedded)
 
 
+class TickerEncoder(nn.Module):
+    """
+    Learns unique embedding per stock.
+
+    Why needed:
+    Model trains on 50 stocks simultaneously.
+    It needs to know WHICH stock it is predicting.
+    TCS behaves differently from RELIANCE.
+
+    Each stock gets a learned 32-dim vector.
+    Model learns:
+      TCS = IT, USD-sensitive, large-cap growth
+      RELIANCE = energy, crude-sensitive, conglomerate
+
+    This is exactly like word embeddings in NLP.
+    Each stock is a "word" with its own meaning.
+    """
+
+    def __init__(self, num_tickers=50, embed_dim=32):
+        super().__init__()
+        self.embedding = nn.Embedding(num_tickers, embed_dim)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, ticker_ids):
+        # ticker_ids: (batch,) integer tensor
+        if ticker_ids.dim() == 2 and ticker_ids.shape[-1] == 1:
+            ticker_ids = ticker_ids.squeeze(-1)
+        embedded = self.embedding(ticker_ids)
+        return self.norm(embedded)
+
+
 class MultimodalEncoder(nn.Module):
     """
     Combines all feature group encoders into one module.
@@ -126,13 +158,16 @@ class MultimodalEncoder(nn.Module):
         self.cross_asset_encoder = FeedForwardEncoder(
             len(CROSS_ASSET_COLS), group_dim, dropout
         )
+        self.ticker_encoder = TickerEncoder(
+            num_tickers=max(1, len(TICKER_LIST)), embed_dim=group_dim
+        )
 
         # Compute column indices for each group
         # These must match ALL_FEATURE_COLS order exactly
         self._build_indices()
 
-        # Fusion layer: 7 groups × group_dim → embed_dim
-        fusion_input_dim = 7 * group_dim
+        # Fusion layer: 7 groups (+ optional ticker) × group_dim → embed_dim
+        fusion_input_dim = 8 * group_dim
         self.fusion = nn.Sequential(
             nn.Linear(fusion_input_dim, embed_dim),
             nn.LayerNorm(embed_dim),
@@ -157,10 +192,10 @@ class MultimodalEncoder(nn.Module):
         self.regime_idx = get_indices(REGIME_COLS)
         self.cross_asset_idx = get_indices(CROSS_ASSET_COLS)
 
-    def forward(self, x):
+    def forward(self, x, ticker_id=None):
         """
         Args:
-            x: (batch, seq_len, 27) — full scaled feature tensor
+            x: (batch, seq_len, num_features) — full scaled feature tensor
                Note: HMM_Regime column is float after scaling
                We convert it back to integer for embedding lookup
 
@@ -191,21 +226,26 @@ class MultimodalEncoder(nn.Module):
         regime_int = regime_int.clamp(0, 2)
         regime_emb = self.regime_encoder(regime_int)
 
-        # Concatenate all embeddings
-        # Each: (batch, seq_len, group_dim=32)
-        fused = torch.cat(
-            [
-                price_emb,
-                vol_emb,
-                tech_emb,
-                momentum_emb,
-                volume_emb,
-                regime_emb,
-                cross_emb,
-            ],
-            dim=-1,
-        )
-        # fused: (batch, seq_len, 7×32=224)
+        embeddings = [
+            price_emb,
+            vol_emb,
+            tech_emb,
+            momentum_emb,
+            volume_emb,
+            regime_emb,
+            cross_emb,
+        ]
+
+        # Add ticker embedding if provided
+        if ticker_id is not None and hasattr(self, "ticker_encoder"):
+            ticker_emb = self.ticker_encoder(ticker_id)
+            ticker_emb = ticker_emb.unsqueeze(1).expand(-1, x.shape[1], -1)
+            embeddings.append(ticker_emb)
+        else:
+            # If not provided, append zeros to keep fusion input dimension stable
+            embeddings.append(torch.zeros_like(price_emb))
+
+        fused = torch.cat(embeddings, dim=-1)
 
         # Project to embed_dim
         return self.fusion(fused)
@@ -228,13 +268,14 @@ if __name__ == "__main__":
     # Test forward pass
     batch_size = 8
     seq_len = 30
-    num_features = 27
+    num_features = len(ALL_FEATURE_COLS)
 
     # Simulate scaled input (StandardScaler output)
     x = torch.randn(batch_size, seq_len, num_features).to(device)
 
     # Forward pass
-    out = encoder(x)
+    ticker_id = torch.zeros(batch_size, dtype=torch.long).to(device)
+    out = encoder(x, ticker_id=ticker_id)
 
     print(f"\nInput shape:  {x.shape}")
     print(f"Output shape: {out.shape}")
@@ -256,17 +297,18 @@ if __name__ == "__main__":
     print("\nTesting with real data...")
     from models.ramt.dataset import RAMTDataModule
 
-    dm = RAMTDataModule("JPM", seq_len=30, batch_size=8)
+    dm = RAMTDataModule("TCS_NS", seq_len=30, batch_size=8)
     folds = dm.get_walk_forward_indices()
     train_idx, test_idx = folds[0]
     train_loader, val_loader, test_loader, dates = dm.get_fold_loaders(
         train_idx, test_idx
     )
 
-    X_batch, y_batch, r_batch = next(iter(train_loader))
+    batch = next(iter(train_loader))
+    X_batch, y_batch, r_batch, t_batch = batch
     X_batch = X_batch.to(device)
 
-    out_real = encoder(X_batch)
+    out_real = encoder(X_batch, ticker_id=t_batch.to(device).squeeze(-1))
     print(f"Real data input shape:  {X_batch.shape}")
     print(f"Real data output shape: {out_real.shape}")
     assert not torch.isnan(out_real).any(), "NaN in real data output!"

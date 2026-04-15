@@ -25,13 +25,26 @@ if not (PROJECT_ROOT / "data" / "raw").exists():
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
-RAW_FILES = [
-    "JPM_raw.csv",
-    "RELIANCE_NS_raw.csv",
-    "TCS_NS_raw.csv",
-    "HDFCBANK_NS_raw.csv",
-    "EPIGRAL_NS_raw.csv",
-]
+NIFTY_RAW_FILENAME = "_NSEI_raw.csv"
+
+
+def list_stock_raw_files(raw_dir: Path) -> list[str]:
+    """
+    Return raw OHLCV CSVs to process as individual stocks.
+
+    Excludes:
+    - NIFTY benchmark raw file (used for relative momentum + target)
+    - Macro series files (macro_*)
+    """
+    out: list[str] = []
+    for p in sorted(raw_dir.glob("*_raw.csv")):
+        name = p.name
+        if name == NIFTY_RAW_FILENAME:
+            continue
+        if name.startswith("macro_"):
+            continue
+        out.append(name)
+    return out
 
 LAG_DAYS = [1, 2, 3, 5, 10, 20]
 
@@ -276,6 +289,109 @@ def add_cross_asset_correlation(
 
 
 # -----------------------------------------------------------------------------
+# Group 8 — Relative Momentum (vs NIFTY 50)
+# -----------------------------------------------------------------------------
+
+
+def add_relative_momentum(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Momentum relative to NIFTY 50 benchmark.
+    These are the most important ranking features.
+
+    Relative momentum = stock return - NIFTY return
+    over multiple lookback periods.
+
+    Stocks beating NIFTY consistently = strong candidates
+    """
+    out = df.copy()
+
+    aligned = out.join(
+        nifty_df[["Log_Return"]].rename(columns={"Log_Return": "NIFTY_Return"}),
+        how="left",
+    )
+    aligned["NIFTY_Return"] = aligned["NIFTY_Return"].fillna(0)
+
+    for window in [5, 21, 63, 126, 252]:
+        stock_cum = out["Log_Return"].rolling(window).sum()
+        nifty_cum = aligned["NIFTY_Return"].rolling(window).sum()
+        out[f"RelMom_{window}d"] = stock_cum - nifty_cum
+
+    mom_12 = out["Log_Return"].rolling(252).sum()
+    mom_1 = out["Log_Return"].rolling(21).sum()
+    out["Mom_12_1"] = mom_12 - mom_1
+
+    nifty_12 = aligned["NIFTY_Return"].rolling(252).sum()
+    nifty_1 = aligned["NIFTY_Return"].rolling(21).sum()
+    out["RelMom_12_1"] = (mom_12 - mom_1) - (nifty_12 - nifty_1)
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Group 9 — Macro Features
+# -----------------------------------------------------------------------------
+
+
+def add_macro_features(df: pd.DataFrame, macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Macro features that affect all Indian stocks.
+
+    USD/INR: affects IT stocks directly
+    Crude:   affects RELIANCE, BPCL, ONGC
+    VIX:     market fear indicator
+    Gold:    risk-off signal
+    """
+    out = df.copy()
+    for name, macro_df in macro_data.items():
+        col = f"Macro_{name}_Ret1d"
+        col5 = f"Macro_{name}_Ret5d"
+
+        ret = macro_df["Log_Return"].rename(col)
+        ret5 = macro_df["Log_Return"].rolling(5).sum().rename(col5)
+
+        out = out.join(ret, how="left")
+        out = out.join(ret5, how="left")
+        out[col] = out[col].fillna(0)
+        out[col5] = out[col5].fillna(0)
+
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Target — Monthly Alpha vs NIFTY
+# -----------------------------------------------------------------------------
+
+
+def compute_monthly_target(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    TARGET VARIABLE — Monthly alpha vs NIFTY
+
+    OLD target: next day log return
+    NEW target: next 21 days stock return
+                minus next 21 days NIFTY return
+
+    Positive = stock beats NIFTY next month = BUY
+    Negative = stock underperforms NIFTY   = AVOID
+
+    This is what we are trying to predict.
+    Much more stable signal than daily returns.
+    """
+    out = df.copy()
+
+    stock_fwd = out["Log_Return"].rolling(21).sum().shift(-21)
+
+    aligned = out.join(
+        nifty_df[["Log_Return"]].rename(columns={"Log_Return": "NIFTY_Return"}),
+        how="left",
+    )
+    nifty_fwd = aligned["NIFTY_Return"].rolling(21).sum().shift(-21)
+
+    out["Monthly_Alpha"] = stock_fwd - nifty_fwd
+    out["Beat_NIFTY"] = (out["Monthly_Alpha"] > 0).astype(int)
+    return out
+
+
+# -----------------------------------------------------------------------------
 # Master pipeline
 # -----------------------------------------------------------------------------
 
@@ -314,12 +430,15 @@ def process_ticker(
     ticker: str,
     df: pd.DataFrame,
     index_returns: dict[str, pd.Series],
+    nifty_df: pd.DataFrame,
+    macro_data: dict[str, pd.DataFrame],
 ) -> pd.DataFrame:
     """
     Run all feature groups in order and return the enriched frame (before global
     dropna — caller drops NaNs and saves).
     """
     out = df.copy()
+    out = out.set_index("Date", drop=False)
     out = add_lagged_returns(out)
     out = add_volatility_features(out)
     out = add_technical_indicators(out)
@@ -327,6 +446,9 @@ def process_ticker(
     out = add_volume_features(out)
     out = add_hmm_regimes(out, ticker)
     out = add_cross_asset_correlation(out, ticker, index_returns)
+    out = add_relative_momentum(out, nifty_df)
+    out = add_macro_features(out, macro_data)
+    out = compute_monthly_target(out, nifty_df)
     return out
 
 
@@ -366,29 +488,58 @@ def download_index_returns(start: pd.Timestamp, end: pd.Timestamp) -> dict[str, 
 def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    frames: list[pd.DataFrame] = []
-    for fname in RAW_FILES:
-        path = RAW_DIR / fname
-        if not path.exists():
-            raise FileNotFoundError(f"Missing raw file: {path}")
-        d = pd.read_csv(path, parse_dates=["Date"])
-        d = d.sort_values("Date").reset_index(drop=True)
-        frames.append(d)
+    raw_files = list_stock_raw_files(RAW_DIR)
+    if not raw_files:
+        raise FileNotFoundError(f"No stock raw files found in: {RAW_DIR}")
 
-    all_dates = pd.concat([f["Date"] for f in frames])
-    start = all_dates.min()
-    end = all_dates.max()
+    nifty_path = RAW_DIR / NIFTY_RAW_FILENAME
+    if not nifty_path.exists():
+        raise FileNotFoundError(f"Missing NIFTY benchmark raw file: {nifty_path}")
+    nifty_df = pd.read_csv(nifty_path, parse_dates=["Date"]).sort_values("Date").reset_index(
+        drop=True
+    )
+    nifty_df = nifty_df.set_index("Date", drop=False)
+
+    macro_data: dict[str, pd.DataFrame] = {}
+    for macro_path in sorted(RAW_DIR.glob("macro_*_raw.csv")):
+        name = macro_path.stem.replace("macro_", "").replace("_raw", "")
+        d = pd.read_csv(macro_path, parse_dates=["Date"]).sort_values("Date").reset_index(
+            drop=True
+        )
+        macro_data[name] = d.set_index("Date", drop=False)
+
+    all_dates = pd.concat(
+        [pd.read_csv(RAW_DIR / f, usecols=["Date"], parse_dates=["Date"])["Date"] for f in raw_files]
+        + [nifty_df["Date"]]
+    )
+    start = pd.Timestamp(all_dates.min())
+    end = pd.Timestamp(all_dates.max())
     print("Downloading index series for cross-asset correlation (NIFTY, S&P 500)...")
     index_returns = download_index_returns(start, end)
 
-    for fname in RAW_FILES:
+    relative_mom_cols = [
+        "RelMom_5d",
+        "RelMom_21d",
+        "RelMom_63d",
+        "RelMom_126d",
+        "RelMom_252d",
+        "Mom_12_1",
+        "RelMom_12_1",
+    ]
+    macro_cols = []
+    for nm in sorted(macro_data.keys()):
+        macro_cols.extend([f"Macro_{nm}_Ret1d", f"Macro_{nm}_Ret5d"])
+
+    engineered_cols_full = list(ENGINEERED_COLS) + relative_mom_cols + macro_cols
+
+    for fname in raw_files:
         stem = _output_stem_from_raw_filename(fname)
         path = RAW_DIR / fname
         df = pd.read_csv(path, parse_dates=["Date"])
         df = df.sort_values("Date").reset_index(drop=True)
         n_orig = len(df)
 
-        enriched = process_ticker(stem, df, index_returns)
+        enriched = process_ticker(stem, df, index_returns, nifty_df, macro_data)
 
         enriched = enriched.dropna(how="any")
         n_after = len(enriched)
@@ -397,10 +548,10 @@ def main() -> None:
             f"→ {n_orig - n_after} lost"
         )
 
-        feat_count = len(ENGINEERED_COLS)
+        feat_count = len(engineered_cols_full)
         print(f"[{stem}] engineered feature columns: {feat_count}")
 
-        enriched = enriched[BASE_COLS + list(ENGINEERED_COLS)]
+        enriched = enriched[BASE_COLS + engineered_cols_full + ["Monthly_Alpha", "Beat_NIFTY"]]
         out_path = PROCESSED_DIR / f"{stem}_features.csv"
         enriched.to_csv(out_path, index=False)
         print(f"Saved: {out_path}")
