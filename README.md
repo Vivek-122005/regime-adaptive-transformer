@@ -8,36 +8,57 @@ This repo builds a **Strategic/Tactical hybrid** trading research system:
 
 ---
 
-## Quickstart (end-to-end)
+## Run the model (every time)
 
-Run in this order (use `.venv/bin/python` so you’re always using the repo venv):
+Work from the **repository root**. Use the project virtualenv so `python` matches `requirements.txt`:
 
 ```bash
-.venv/bin/python data/download.py
-.venv/bin/python features/feature_engineering.py
-.venv/bin/python models/run_final_2024_2026.py
+cd /path/to/regime-adaptive-transformer
+python3 -m venv .venv          # once per machine
+source .venv/bin/activate      # Windows: .venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+**Full pipeline** (download → features → train + walk-forward + backtest):
+
+```bash
+source .venv/bin/activate
+python data/download.py
+python features/feature_engineering.py
+python -m models.run_final_2024_2026
+```
+
+Optional **dashboard** (after a successful run):
+
+```bash
 ./run_dashboard.sh
 ```
 
-If you change feature definitions (example: replacing RSI/Bollinger absolute values with distance/z-score features), you **must re-run**:
+| Step | What it does |
+|------|----------------|
+| `data/download.py` | Fetches/updates raw OHLCV parquets under `data/raw/`. |
+| `features/feature_engineering.py` | Builds processed parquets in `data/processed/` (features, `HMM_Regime`, **`Sector`**, **`Sector_Alpha`**, `Monthly_Alpha`, …). **Run this after any change to feature code or when you need fresh labels.** |
+| `python -m models.run_final_2024_2026` | Fits scalers + trains RAMT walk-forward, writes predictions and backtest CSVs under `results/`. |
 
-```bash
-.venv/bin/python features/feature_engineering.py
-```
+**Model-only rerun** (processed data unchanged): skip download; only run `models.run_final_2024_2026`. If training fails with missing **`Sector_Alpha`** / **`Sector`**, re-run **`features/feature_engineering.py`** end-to-end so the panel step fills sector-neutral targets.
 
-Outputs (written to `results/`):
-- `results/ranking_predictions.csv`
-- `results/monthly_rankings.csv`
-- `results/backtest_results.csv`
-- `results/ramt_model_state.pt` and `results/ramt_scaler.joblib` (for explainability / audits)
+**Notebook (optional):** `RAMT_Monolith_Trainer.ipynb` mirrors the same training stack for an all-in-one environment; keep it in sync with `models/ramt/train_ranking.py` when you change architecture.
+
+**Artifacts in `results/`** (typical):
+
+- `ranking_predictions.csv`, `monthly_rankings.csv`, `backtest_results.csv`
+- `ramt_model_state.pt`, `ramt_scaler.joblib`, `ramt_y_scaler.joblib` (for inference, dashboards, attention tools)
+
+**Note:** After architecture changes, old `ramt_model_state.pt` checkpoints may not load; retrain with the command above.
 
 ---
 
 ## What exactly is the model predicting?
 
 ### Strategic (monthly ranking target)
-- **`Monthly_Alpha`** = (stock forward 21-trading-day return) − (NIFTY forward 21-trading-day return)
-- **`Monthly_Alpha_Z`** = `Monthly_Alpha / trailing_21d_vol` (risk-adjusted version; currently used in the final runner)
+- **`Monthly_Alpha`** = (stock forward 21-trading-day log return) − (NIFTY forward 21-trading-day log return) — benchmark-relative outperformance.
+- **`Sector_Alpha`** = `Monthly_Alpha` minus the **median `Monthly_Alpha` in the same (date, sector) cohort** — used as the primary training target when processed parquets include it (see `features/feature_engineering.py`). If `Sector_Alpha` is absent, the loader falls back to **`Monthly_Alpha`**.
+- **`Monthly_Alpha_Z`** = `Monthly_Alpha / trailing_21d_vol` (risk-adjusted variant; used in some audits / `permutation_importance` examples).
 
 ### Tactical (daily sanity-check target)
 - **`Daily_Return`** = next-day `Log_Return` (shifted by -1)
@@ -112,8 +133,8 @@ regime-adaptive-transformer/
 │       ├── encoder.py
 │       ├── moe.py
 │       ├── model.py
-│       ├── losses.py
-│       └── train_ranking.py
+│       ├── losses.py          # TournamentRankingLoss + CombinedLoss
+│       └── train_ranking.py   # walk-forward training, sector / y-scaler
 ├── dashboard/
 │   └── app.py
 ├── FEATURES_AND_REGIMES.md
@@ -177,7 +198,7 @@ This section is intentionally “journal style”: **what changed** and **why**.
 - This is a **research system**, not financial advice.
 - For reproducibility, prefer `.venv/bin/python ...` commands.
 
-**Last updated:** 2026-04-15
+**Last updated:** 2026-04-16
 
 | Tool | Role | Why we use it | Alternatives | Why this choice here |
 |------|------|---------------|--------------|----------------------|
@@ -649,4 +670,4 @@ No `LICENSE` file is present in the repository as of this writing. Before public
 
 *This README describes the repository as implemented; scripts and hyperparameters may evolve—prefer reading source files for authoritative behavior.*
 
-**Last updated:** 2026-04-15
+**Last updated:** 2026-04-16
