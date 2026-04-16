@@ -17,7 +17,6 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 import torch
-import yfinance as yf
 from plotly.subplots import make_subplots
 
 # Project root
@@ -120,7 +119,7 @@ def _inject_theme_css() -> None:
 
 
 st.set_page_config(
-    page_title="RAMT · Simulation Workbench",
+    page_title="RAMT · Production Terminal",
     page_icon="◈",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -313,6 +312,17 @@ def filter_ranking_by_dates(
     return out
 
 
+def _regime_allocation_gear(reg: int | None, top_n: int) -> tuple[float, int]:
+    """BULL 100% / HIGH_VOL 50%×3 / BEAR 20%×5; ``reg is None`` → legacy full top_n."""
+    if reg is None:
+        return 1.0, top_n
+    if reg == 0:
+        return 0.5, min(3, top_n)
+    if reg == 2:
+        return 0.2, min(5, top_n)
+    return 1.0, top_n
+
+
 def simulate_portfolio(
     full: pd.DataFrame,
     start: pd.Timestamp,
@@ -321,6 +331,7 @@ def simulate_portfolio(
     initial_capital: float,
     test_only: bool,
     nifty_prices: pd.Series | None,
+    regime_series: pd.Series | None = None,
 ) -> dict[str, Any] | None:
     need = {"Date", "Ticker", "predicted_alpha", "actual_alpha"}
     if not need.issubset(full.columns):
@@ -339,11 +350,17 @@ def simulate_portfolio(
     period_excess: list[float] = []
     rows_detail: list[dict[str, Any]] = []
     for d in reb_dates:
-        block = df[df["Date"] == d].nlargest(top_n, "predicted_alpha")
+        ts = pd.Timestamp(d)
+        reg = regime_at(regime_series, ts) if regime_series is not None else None
+        alloc, n_pick = _regime_allocation_gear(reg, top_n)
+        block = df[df["Date"] == d].nlargest(n_pick, "predicted_alpha")
         if block.empty:
             continue
         m_excess = float(block["actual_alpha"].mean())
-        period_excess.append(m_excess)
+        period_ret = float(m_excess * alloc)
+        if reg == 2:
+            period_ret = float(max(period_ret, -0.05))
+        period_excess.append(period_ret)
         tickers = block["Ticker"].astype(str).tolist()
         rows_detail.append(
             {
@@ -352,6 +369,9 @@ def simulate_portfolio(
                 "tickers_list": tickers,
                 "mean_actual_alpha": m_excess,
                 "n_names": len(block),
+                "regime": reg,
+                "allocation": alloc,
+                "period_return": period_ret,
             }
         )
 
@@ -554,35 +574,69 @@ def render_sidebar(
             st.warning("No `results/*_predictions.csv` found.")
 
         st.markdown("---")
-        st.markdown("### Date window (2023–2026)")
+        st.markdown("### Date window (2023–2026 blind test)")
 
         if dmin is None:
             st.caption("Add `results/ranking_predictions.csv` to enable scrubbing.")
             ds, de = w_lo.date(), w_hi.date()
             live_test_only = True
+            date_start = pd.Timestamp(ds)
+            date_end = pd.Timestamp(de)
         else:
             live_test_only = st.checkbox(
                 "Blind test rows only (`Period == Test`)",
                 value=True,
                 help="Uncheck to include train-era rows in the window.",
             )
-            ds, de = st.date_input(
-                "Range",
-                value=(w_lo.date(), w_hi.date()),
-                min_value=w_lo.date(),
-                max_value=w_hi.date(),
-                help="Metrics and equity use this inclusive window.",
+            all_reb = sorted(
+                {pd.Timestamp(d).normalize() for d in pd.to_datetime(ranking_df["Date"])}
             )
-
-        if isinstance(ds, tuple):
-            start_d, end_d = ds[0], ds[1]
-        else:
-            start_d = end_d = ds
-
-        date_start = pd.Timestamp(start_d)
-        date_end = pd.Timestamp(end_d)
-        if date_start > date_end:
-            date_start, date_end = date_end, date_start
+            all_reb = [d for d in all_reb if w_lo <= d <= w_hi]
+            if len(all_reb) >= 2:
+                n1 = len(all_reb) - 1
+                idx_pair = st.slider(
+                    "Scrub rebalance window (cached metrics & equity)",
+                    min_value=0,
+                    max_value=n1,
+                    value=(0, n1),
+                    help="Slide both ends — updates DA, Sharpe, max DD, and equity instantly.",
+                )
+                i0, i1 = int(idx_pair[0]), int(idx_pair[1])
+                if i0 > i1:
+                    i0, i1 = i1, i0
+                date_start = all_reb[i0]
+                date_end = all_reb[i1]
+            else:
+                yr_a = max(2023, w_lo.year)
+                yr_b = min(2026, w_hi.year)
+                if yr_a > yr_b:
+                    yr_a, yr_b = yr_b, yr_a
+                yr_rng = st.slider(
+                    "Year range",
+                    min_value=2023,
+                    max_value=2026,
+                    value=(yr_a, yr_b),
+                )
+                date_start = pd.Timestamp(f"{yr_rng[0]}-01-01")
+                date_end = pd.Timestamp(f"{yr_rng[1]}-12-31")
+                date_start = max(date_start, w_lo)
+                date_end = min(date_end, w_hi)
+                if date_start > date_end:
+                    date_start, date_end = date_end, date_start
+                st.caption("Fine-tune with calendar (optional)")
+                cal = st.date_input(
+                    "Calendar range",
+                    value=(date_start.date(), date_end.date()),
+                    min_value=w_lo.date(),
+                    max_value=w_hi.date(),
+                )
+                if isinstance(cal, tuple):
+                    date_start = pd.Timestamp(cal[0])
+                    date_end = pd.Timestamp(cal[1])
+                else:
+                    date_start = date_end = pd.Timestamp(cal)
+                if date_start > date_end:
+                    date_start, date_end = date_end, date_start
 
         # As-of date for shadow picks: rebalance dates inside window
         if ranking_df is not None and not ranking_df.empty:
@@ -618,7 +672,7 @@ def render_sidebar(
         chart_days = st.slider("Chart history (days)", 30, 365, 120, step=30)
 
         st.markdown("---")
-        if st.button("Refresh cache", use_container_width=True):
+        if st.button("Refresh cache", width="stretch"):
             st.cache_data.clear()
             st.rerun()
 
@@ -644,7 +698,7 @@ def render_charts(
     if fig is None:
         st.info("No rebalances in this window — widen the date range or disable test-only.")
         return
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
 
 def build_live_equity_figure(
@@ -734,7 +788,7 @@ def plot_actual_vs_predicted(predictions_df: pd.DataFrame | None, ticker_code: s
     df = predictions_df[predictions_df["Ticker"] == ticker_code].copy().sort_values("Date").tail(days)
     if df.empty:
         return None
-
+    
     fig = make_subplots(
         rows=2,
         cols=1,
@@ -807,7 +861,7 @@ def plot_cumulative_returns(predictions_df: pd.DataFrame | None, ticker_code: st
     fig.add_trace(
         go.Scatter(
             x=df["Date"],
-            y=strategy * 100,
+        y=strategy * 100,
             name="Strategy",
             line=dict(color="#4ade80", width=2),
             fill="tozeroy",
@@ -817,7 +871,7 @@ def plot_cumulative_returns(predictions_df: pd.DataFrame | None, ticker_code: st
     fig.add_trace(
         go.Scatter(
             x=df["Date"],
-            y=bah * 100,
+        y=bah * 100,
             name="Buy & hold",
             line=dict(color="#38bdf8", width=2, dash="dash"),
         )
@@ -1064,63 +1118,28 @@ def get_current_regime(df: pd.DataFrame | None) -> dict[str, Any] | None:
 
 # ─── Live market pulse & RAMT inference ────────────────────
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_live_macro_data_cached() -> dict[str, Any]:
+def fetch_live_macro_data_cached(ticker_stem: str, root_s: str) -> dict[str, Any]:
     """Hourly cache — keeps demos snappy on repeated clicks."""
-    from dashboard.market_pulse import fetch_live_macro_data_engine
+    from dashboard.market_scraper import fetch_live_macro_data_engine
 
-    return fetch_live_macro_data_engine()
-
-
-def _flatten_yfinance_hist(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    if isinstance(out.columns, pd.MultiIndex):
-        out.columns = out.columns.get_level_values(0)
-    out.columns = [str(c).strip() for c in out.columns]
-    return out
+    return fetch_live_macro_data_engine(ticker_stem, Path(root_s))
 
 
-def stem_to_yfinance_symbol(stem: str) -> str:
-    if stem.endswith("_NS"):
-        return stem[:-3] + ".NS"
-    return stem
-
-
-def compute_live_stock_feature_row(stem: str) -> pd.Series | None:
-    """Last row of price/tech/volume features from yfinance (same helpers as training)."""
-    from features.feature_engineering import (
-        add_bollinger_distance,
-        add_returns_features,
-        add_rsi_14,
-        add_volume_surge,
-    )
-
-    sym = stem_to_yfinance_symbol(stem)
-    try:
-        hist = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
-    except Exception:
+def compute_live_stock_feature_row(stem: str, root: Path) -> pd.Series | None:
+    """Last-known price/tech/volume row from processed Parquet (no network I/O)."""
+    pq = root / "data" / "processed" / f"{stem}_features.parquet"
+    if not pq.is_file():
         return None
-    if hist is None or hist.empty or len(hist) < 30:
+    df = pd.read_parquet(pq)
+    if df.empty:
         return None
-    h = _flatten_yfinance_hist(hist).rename_axis("Date").reset_index()
-    if "Adj Close" not in h.columns and "Close" in h.columns:
-        h["Adj Close"] = h["Close"].astype(float)
-    if "Adj Close" not in h.columns:
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date")
+    last = df.iloc[-1]
+    need = list(PRICE_COLS + TECH_COLS + VOLUME_COLS)
+    if not all(c in last.index for c in need):
         return None
-    for col in ("Open", "High", "Low", "Close"):
-        if col not in h.columns:
-            h[col] = h["Adj Close"]
-    if "Volume" not in h.columns:
-        h["Volume"] = 1.0
-    h["Date"] = pd.to_datetime(h["Date"]).dt.tz_localize(None)
-    h = add_returns_features(h)
-    h = add_rsi_14(h)
-    h = add_bollinger_distance(h)
-    h = add_volume_surge(h)
-    req = set(PRICE_COLS + TECH_COLS + VOLUME_COLS)
-    h = h.dropna(subset=list(req))
-    if h.empty:
-        return None
-    return h.iloc[-1]
+    return last[need]
 
 
 def build_live_ramt_sequence(
@@ -1130,7 +1149,7 @@ def build_live_ramt_sequence(
 ) -> tuple[np.ndarray, int] | None:
     """
     Build raw (unscaled) 30×F feature tensor: 29 historical rows from Parquet + 1 live row.
-    Live row = latest stock features (yfinance) + macro from macro_pack (training-aligned).
+    Live row = latest stock features (Parquet last-known) + macro from macro_pack (training-aligned).
     """
     pq = root / "data" / "processed" / f"{ticker_stem}_features.parquet"
     if not pq.is_file():
@@ -1146,7 +1165,7 @@ def build_live_ramt_sequence(
 
     base = raw[ALL_FEATURE_COLS].values.astype(np.float32)
     feats = macro_pack.get("macro_features") or {}
-    srow = compute_live_stock_feature_row(ticker_stem)
+    srow = compute_live_stock_feature_row(ticker_stem, root)
 
     idx = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
     live = np.zeros(len(ALL_FEATURE_COLS), dtype=np.float32)
@@ -1154,7 +1173,7 @@ def build_live_ramt_sequence(
     if srow is not None:
         for c in PRICE_COLS + TECH_COLS + VOLUME_COLS:
             live[idx[c]] = float(srow[c])
-    else:
+        else:
         live = base[-1].copy()
 
     for c in MACRO_COLS:
@@ -1191,6 +1210,33 @@ def apply_predictor_form_to_last_row(
     return out
 
 
+def impute_missing_with_training_medians(seq_unscaled: np.ndarray, scaler: Any) -> np.ndarray:
+    """
+    Fill NaN / non-finite values using training-set medians from RobustScaler.center_
+    (or StandardScaler.mean_ if present). Keeps X aligned with what the scaler expects.
+    """
+    out = np.asarray(seq_unscaled, dtype=np.float64).copy()
+    _, n_cols = out.shape
+    fill = np.zeros(n_cols, dtype=np.float64)
+    center = getattr(scaler, "center_", None)
+    if center is not None:
+        fill = np.asarray(center, dtype=np.float64).ravel()
+    elif getattr(scaler, "mean_", None) is not None:
+        fill = np.asarray(scaler.mean_, dtype=np.float64).ravel()
+    if fill.size == 0:
+        fill = np.zeros(n_cols, dtype=np.float64)
+    elif fill.size < n_cols:
+        fill = np.resize(fill, n_cols)
+        else:
+        fill = fill[:n_cols]
+    for j in range(n_cols):
+        col = out[:, j]
+        bad = ~np.isfinite(col)
+        if bad.any():
+            out[bad, j] = fill[j]
+    return out.astype(np.float32)
+
+
 def run_ramt_live_predict(
     ticker_stem: str,
     root: Path,
@@ -1203,8 +1249,9 @@ def run_ramt_live_predict(
     regime_id: int,
 ) -> tuple[float | None, float | None, str]:
     """
-    Load RobustScaler + checkpoint, scale inputs, run model.forward.
-    Returns (monthly_pred, daily_pred, status_message).
+    Load `results/ramt_scaler.joblib`, impute missing values with training medians,
+    transform the 10 RAMT feature columns, then `model.forward` (regime is separate
+    from X — not scaled). Returns (monthly_pred, daily_pred, status_message).
     """
     scaler_path = root / "results" / "ramt_scaler.joblib"
     y_scaler_path = root / "results" / "ramt_y_scaler.joblib"
@@ -1220,8 +1267,24 @@ def run_ramt_live_predict(
         seq_unscaled, ret_1d_pct, mom_20_pct, rsi, bb_dist, vol_surge
     )
 
+    n_feat_expected = len(ALL_FEATURE_COLS)
+    if seq_unscaled.shape[1] != n_feat_expected:
+        return None, None, "bad_sequence_shape"
+
     scaler = joblib.load(scaler_path)
-    X = scaler.transform(seq_unscaled).astype(np.float32)
+    nf = getattr(scaler, "n_features_in_", None)
+    if nf is not None and int(nf) != n_feat_expected:
+        return None, None, "scaler_mismatch"
+
+    seq_unscaled = impute_missing_with_training_medians(seq_unscaled, scaler)
+
+    try:
+        X = scaler.transform(seq_unscaled).astype(np.float32)
+    except ValueError as e:
+        err = str(e).lower()
+        if "feature" in err or "shape" in err:
+            return None, None, "scaler_mismatch"
+        raise
     X_t = torch.from_numpy(X).unsqueeze(0)
     regime = int(np.clip(regime_id, 0, 2))
     r = torch.tensor([regime], dtype=torch.long)
@@ -1253,24 +1316,25 @@ def run_ramt_live_predict(
 
 
 def render_live_predictor_section(state: SidebarState) -> None:
-    st.markdown("---")
+        st.markdown("---")
     st.markdown("### Live predictor")
     st.caption(
-        "One-click **market pulse** (VIX, crude, NIFTY trend, USD/INR) + RAMT forward pass "
-        "with the same **RobustScaler** as training."
+        "Raw **MarketScraper** (requests + BeautifulSoup) · **10 features** scaled with "
+        "`results/ramt_scaler.joblib`; **HMM regime** is passed separately (not in X). "
+        "Missing feature values use **training medians** from the scaler before `transform`."
     )
 
     b1, b2 = st.columns([1, 2])
     with b1:
-        if st.button("⚡ Auto-Fill with Current Market Data", key="btn_autofill_market"):
-            with st.spinner("Fetching Market Pulse…"):
-                pack = fetch_live_macro_data_cached()
+        if st.button("⚡ Sync Live Market Pulse", key="btn_autofill_market"):
+            with st.spinner("Syncing live market pulse…"):
+                pack = fetch_live_macro_data_cached(state.ticker_code, str(ROOT))
             st.session_state["lp_macro_pack"] = pack
             st.session_state["lp_fetch_utc"] = datetime.now(timezone.utc).isoformat()
             if pack.get("ok"):
                 st.session_state["lp_ret_1d_pct"] = float(pack.get("nifty_ret_1d_pct", 0.0))
                 st.session_state["lp_mom_20_pct"] = float(pack.get("nifty_mom_20_pct", 0.0))
-                srow = compute_live_stock_feature_row(state.ticker_code)
+                srow = compute_live_stock_feature_row(state.ticker_code, ROOT)
                 if srow is not None:
                     st.session_state["lp_rsi"] = float(srow["RSI_14"])
                     st.session_state["lp_bb"] = float(srow["BB_Dist"])
@@ -1352,14 +1416,14 @@ def render_live_predictor_section(state: SidebarState) -> None:
                 index=int(st.session_state.get("lp_regime", 1)),
             )
 
-        go_btn = st.form_submit_button("Run RAMT (scaled inference)", use_container_width=True)
+        go_btn = st.form_submit_button("Run RAMT (scaled inference)", width="stretch")
 
     macro_for_predict = st.session_state.get("lp_macro_pack") or {}
     if go_btn:
         if not macro_for_predict.get("ok"):
             st.info(
                 "Macro columns will use **Parquet fallbacks** until a successful auto-fill "
-                "(live Macro_* need yfinance)."
+                "(live Macro_* need a successful **Auto-fill** scrape)."
             )
         with st.spinner("Running RobustScaler + model.forward…"):
             pm, pd_, status = run_ramt_live_predict(
@@ -1380,6 +1444,16 @@ def render_live_predictor_section(state: SidebarState) -> None:
             )
         elif status == "no_sequence":
             st.warning(f"Could not build a sequence for `{state.ticker_code}` — check Parquet.")
+        elif status == "bad_sequence_shape":
+            st.error("Internal error: feature matrix width does not match `ALL_FEATURE_COLS`.")
+        elif status == "scaler_mismatch":
+            st.error(
+                "`results/ramt_scaler.joblib` does not match this RAMT build: on disk it encodes a "
+                "different **number of features** (often a stale `StandardScaler` from another baseline). "
+                f"The live predictor needs **{len(ALL_FEATURE_COLS)}** columns (`ALL_FEATURE_COLS`) from "
+                "the **RobustScaler** written by `models/ramt/train_ranking.py` or "
+                "`python models/run_final_2024_2026.py`. Delete the bad file and re-run training."
+            )
         elif status == "ok" and pm is not None:
             st.success(
                 f"**Monthly head (α-space):** {pm:.6f} · **Daily head:** {pd_:.6f} · "
@@ -1410,7 +1484,7 @@ def render_live_performance_tab(
     shadow_regime: int | None,
 ) -> None:
     st.markdown("### Live performance")
-    st.caption(
+            st.caption(
         "Window metrics recompute from the selected dates; deltas compare to the full "
         "available backtest (same test-only filter)."
     )
@@ -1434,29 +1508,29 @@ def render_live_performance_tab(
         "Max drawdown",
         f"{metrics_win['MaxDD']*100:.2f}%",
         delta=f"{md_d*100:+.2f} pp vs full",
-    )
+                )
 
     st.markdown("---")
-    st.markdown("### Model conviction (shadow picks)")
-    st.caption(
-        "Top 5 by **predicted_alpha** on the as-of date — informational only; "
-        "not the live position sizing rule."
-    )
     if shadow_regime == 2:
         st.markdown(
-            '<div class="shadow-badge-bear">STATUS: PROTECTIVE CASH (0%)</div>',
+            '<div class="shadow-badge-bear">Status: PROTECTIVE CASH (0%)</div>',
             unsafe_allow_html=True,
         )
-        st.caption(
-            "BEAR regime would map to cash in the production rules; the table still "
-            "shows model rankings to verify the transformer remains active."
+    st.caption(
+            "HMM **BEAR** vetoes live deployment to cash — shadow table still shows model "
+            "rankings so the Transformer signal remains visible."
         )
+
+    st.markdown("#### Current model conviction (shadow picks)")
+    st.caption(
+        "Top 5 tickers by **predicted_alpha** at the as-of date (informational only)."
+    )
 
     if shadow_df is not None and not shadow_df.empty:
         disp = shadow_df.copy()
         disp["predicted_alpha"] = (disp["predicted_alpha"] * 100).map(lambda x: f"{x:.3f}%")
         disp["actual_alpha"] = (disp["actual_alpha"] * 100).map(lambda x: f"{x:.3f}%")
-        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.dataframe(disp, width="stretch", hide_index=True)
     else:
         st.info("No ranking rows for this as-of date.")
 
@@ -1476,7 +1550,7 @@ def render_live_performance_tab(
     if sim_window and sim_window.get("rows_detail") is not None and not sim_window["rows_detail"].empty:
         with st.expander("Rebalance detail (window)"):
             rd = sim_window["rows_detail"].drop(columns=["tickers_list"], errors="ignore")
-            st.dataframe(rd, use_container_width=True, hide_index=True)
+            st.dataframe(rd, width="stretch", hide_index=True)
 
     render_live_predictor_section(state)
 
@@ -1511,7 +1585,7 @@ def render_live_performance_tab(
         )
         fig.update_xaxes(gridcolor="#1e293b")
         fig.update_yaxes(gridcolor="#1e293b")
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width="stretch")
 
 
 def render_training_analytics_tab(
@@ -1526,7 +1600,7 @@ def render_training_analytics_tab(
     if train_png.is_file():
         st.markdown("### Training run")
         st.caption("Blind-split RAMT — loss, LR, generalization gap.")
-        st.image(str(train_png), use_container_width=True)
+        st.image(str(train_png), width="stretch")
         if train_csv.is_file():
             st.download_button(
                 label="Download training_history.csv",
@@ -1552,25 +1626,25 @@ def render_training_analytics_tab(
         mcols[2].metric("MAE", f"{ramt_m.get('MAE', 0):.5f}")
         mcols[3].metric("ρ", f"{ramt_m.get('ρ', 0):.3f}")
         mcols[4].metric("n", f"{ramt_m.get('n', 0)}")
-        st.plotly_chart(fig_ramt, use_container_width=True)
+        st.plotly_chart(fig_ramt, width="stretch")
 
     st.markdown("---")
     st.markdown("### Model comparison")
     fig_comp = plot_metrics_comparison(all_predictions, state.ticker_code)
-    if fig_comp:
-        st.plotly_chart(fig_comp, use_container_width=True)
-    if all_predictions:
-        rows = []
-        for model_name, pred_df in all_predictions.items():
+        if fig_comp:
+        st.plotly_chart(fig_comp, width="stretch")
+        if all_predictions:
+            rows = []
+            for model_name, pred_df in all_predictions.items():
             t_df = pred_df[pred_df["Ticker"] == state.ticker_code]
-            if t_df.empty:
-                continue
+                if t_df.empty:
+                    continue
             m = compute_metrics(t_df["y_true"].values, t_df["y_pred"].values)
             m["Model"] = model_name
-            rows.append(m)
-        if rows:
+                rows.append(m)
+            if rows:
             mt = pd.DataFrame(rows).set_index("Model")
-            st.dataframe(
+                st.dataframe(
                 mt.style.format(
                     {
                         "RMSE": "{:.4f}",
@@ -1580,7 +1654,7 @@ def render_training_analytics_tab(
                         "MaxDD": "{:.4f}",
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
             )
 
     st.markdown("---")
@@ -1590,14 +1664,14 @@ def render_training_analytics_tab(
     with c1:
         f1 = plot_actual_vs_predicted(primary_preds, state.ticker_code, state.chart_days)
         if f1:
-            st.plotly_chart(f1, use_container_width=True)
+            st.plotly_chart(f1, width="stretch")
     with c2:
         f2 = plot_cumulative_returns(primary_preds, state.ticker_code)
         if f2:
-            st.plotly_chart(f2, use_container_width=True)
+            st.plotly_chart(f2, width="stretch")
     f3 = plot_regime_history(features_df, days=min(180, state.chart_days + 60))
     if f3:
-        st.plotly_chart(f3, use_container_width=True)
+        st.plotly_chart(f3, width="stretch")
 
 
 def render_raw_data_explorer_tab(
@@ -1624,7 +1698,7 @@ def render_raw_data_explorer_tab(
                     "Direction_Correct": "Dir match",
                 }
             ),
-            use_container_width=True,
+            width="stretch",
             height=420,
         )
     elif ranking_preds_df is not None and not ranking_preds_df.empty:
@@ -1647,7 +1721,7 @@ def render_raw_data_explorer_tab(
                         "Direction_Correct": "Dir match",
                     }
                 ),
-                use_container_width=True,
+                width="stretch",
                 height=420,
             )
     else:
@@ -1657,7 +1731,8 @@ def render_raw_data_explorer_tab(
 
 # ─── Main ────────────────────────────────────────────────────
 def main() -> None:
-    data = load_data(str(ROOT))
+    with st.spinner("Ensuring NIFTY index features & loading results…"):
+        data = load_data(str(ROOT))
     ranking_df = data["ranking_df"]
 
     state = render_sidebar(ranking_df)
@@ -1690,6 +1765,7 @@ def main() -> None:
             state.sim_capital,
             state.live_test_only,
             nifty_prices,
+            data.get("regime_series"),
         )
         if ranking_df is not None
         else None
@@ -1703,6 +1779,7 @@ def main() -> None:
             state.sim_capital,
             state.live_test_only,
             nifty_prices,
+            data.get("regime_series"),
         )
         if ranking_df is not None
         else None
@@ -1726,8 +1803,8 @@ def main() -> None:
 
     all_predictions = load_all_predictions()
 
-    st.markdown("# RAMT · simulation workbench")
-    st.caption("Interactive historical performance · JetBrains Mono · dark workspace")
+    st.markdown("# RAMT · production terminal")
+    st.caption("Live simulator · shadow conviction · market scraper · JetBrains Mono")
 
     tab_live, tab_train, tab_raw = st.tabs(["Live performance", "Training analytics", "Raw data explorer"])
 

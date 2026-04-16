@@ -3,7 +3,7 @@ RAMT Data Pipeline — Step 2: Feature Engineering
 Transforms raw OHLCV(+Adj Close) data into a feature matrix per ticker.
 
 This version is refactored for the NIFTY 200 Parquet-based raw store:
-- Batch-process all stock Parquet files in `data/raw/`.
+- Batch-process all equity Parquet files in `data/raw/` (including ``_NSEI.parquet`` or ``_NSEI_raw.csv``).
 - Compute returns (log) over 1d, 5d, 21d using **Adj Close**.
 - Compute technicals: RSI(14), Bollinger Band distance, Volume Surge (Vol / SMA20 Vol).
 - Merge macro series (INDIAVIX, CRUDE, USDINR, SP500) using 1-day lagged returns (no leakage).
@@ -64,20 +64,29 @@ def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def list_stock_parquet_files(raw_dir: Path) -> list[Path]:
     """
-    Return stock raw Parquet files to process.
+    Return equity raw Parquet files to process (includes ``_NSEI.parquet``).
 
-    Excludes:
-    - Macro series files: macro_*.parquet
-    - Benchmark parquet: _NSEI.parquet (if present)
+    Excludes macro series files (``macro_*.parquet``) only.
     """
     out: list[Path] = []
     for p in sorted(raw_dir.glob("*.parquet")):
         if p.name.startswith("macro_"):
             continue
-        if p.name == NIFTY_BENCHMARK_PARQUET.name:
-            continue
         out.append(p)
     return out
+
+
+def list_equity_input_paths(raw_dir: Path) -> list[Path]:
+    """
+    Parquet inputs under ``raw_dir`` plus ``_NSEI_raw.csv`` when no ``_NSEI.parquet`` exists.
+    """
+    paths = list_stock_parquet_files(raw_dir)
+    nse_pq = raw_dir / "_NSEI.parquet"
+    nse_csv = raw_dir / "_NSEI_raw.csv"
+    if not nse_pq.exists() and nse_csv.exists():
+        paths = [p for p in paths if p.name != "_NSEI_raw.csv"]
+        paths.append(nse_csv)
+    return sorted(set(paths))
 
 
 def _read_raw_parquet(path: Path) -> pd.DataFrame:
@@ -90,9 +99,116 @@ def _read_raw_parquet(path: Path) -> pd.DataFrame:
     return df
 
 
+def _read_raw_equity_csv(path: Path) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    df = df.sort_values("Date").reset_index(drop=True)
+    if "Adj Close" not in df.columns and "Close" in df.columns:
+        df["Adj Close"] = df["Close"].astype(float)
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in df.columns and "Adj Close" in df.columns:
+            df[col] = df["Adj Close"]
+    if "Volume" not in df.columns:
+        df["Volume"] = 1.0
+    if "Ticker" not in df.columns:
+        df.insert(0, "Ticker", NIFTY_BENCHMARK_TICKER)
+    missing = [c for c in RAW_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path.name}: missing columns {missing}; have {list(df.columns)}")
+    return df
+
+
+def _read_raw_equity(path: Path) -> pd.DataFrame:
+    """Load OHLCV (+Ticker) from Parquet or CSV (e.g. ``_NSEI_raw.csv``)."""
+    suf = path.suffix.lower()
+    if suf == ".csv":
+        return _read_raw_equity_csv(path)
+    if suf == ".parquet":
+        return _read_raw_parquet(path)
+    raise ValueError(f"Unsupported raw equity path: {path}")
+
+
+# Full engineered schema per ticker (RAMT uses ``ALL_FEATURE_COLS`` subset in dataset.py).
+FEATURE_OUTPUT_COLUMNS: list[str] = [
+    "Date",
+    "Ticker",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Adj Close",
+    "Volume",
+    "Ret_1d",
+    "Ret_5d",
+    "Ret_21d",
+    "Realized_Vol_20",
+    "RSI_14",
+    "BB_Dist",
+    "Volume_Surge",
+] + [f"Macro_{k}_Ret1d_L1" for k in MACRO_TICKERS.keys()] + [
+    "Monthly_Alpha",
+    "Daily_Return",
+    "HMM_Regime",
+]
+
+
+def build_features_table(
+    df: pd.DataFrame,
+    nifty_df: pd.DataFrame,
+    macro_data: dict[str, pd.DataFrame],
+) -> pd.DataFrame:
+    """
+    Full feature pipeline for one ticker OHLCV frame (same logic for index and stocks).
+    """
+    out = df.copy()
+    out = add_returns_features(out)
+    out = add_realized_vol_20(out)
+    out = add_rsi_14(out)
+    out = add_bollinger_distance(out)
+    out = add_volume_surge(out)
+    out = add_macro_lagged_returns(out, macro_data)
+    out = compute_monthly_alpha_adjclose(out, nifty_df)
+    out = add_daily_target(out)
+    out = add_hmm_regime_full_history(out)
+    out = out[FEATURE_OUTPUT_COLUMNS]
+    return out
+
+
+def process_raw_equity_path(
+    path: Path,
+    nifty_df: pd.DataFrame,
+    macro_data: dict[str, pd.DataFrame],
+    processed_dir: Path,
+) -> tuple[str, Path] | tuple[str, None]:
+    """
+    Read one raw file, compute features, write ``{{stem}}_features.parquet``.
+
+    Returns ``(ticker_label, output_path)`` or ``(ticker_label, None)`` if empty after dropna.
+    """
+    df = _read_raw_equity(path)
+    ticker = str(df["Ticker"].iloc[0]) if "Ticker" in df.columns and len(df) else path.stem
+
+    n_orig = len(df)
+    out = build_features_table(df, nifty_df, macro_data)
+    out = out.dropna(how="any")
+
+    if len(out) == 0:
+        print(f"[{ticker}] rows: {n_orig} original → 0 after dropna → [SKIP] empty features")
+        return ticker, None
+
+    out_path = processed_dir / f"{_safe_stem_from_ticker(ticker)}_features.parquet"
+    out.to_parquet(out_path, index=False)
+    print(f"[{ticker}] rows: {n_orig} original → {len(out)} after dropna → saved {out_path.name}")
+    return ticker, out_path
+
+
 def _download_benchmark_if_missing() -> Path:
     if NIFTY_BENCHMARK_PARQUET.exists():
         return NIFTY_BENCHMARK_PARQUET
+
+    csv_alt = NIFTY_BENCHMARK_PARQUET.parent / "_NSEI_raw.csv"
+    if csv_alt.exists():
+        return csv_alt
 
     print(f"Benchmark parquet missing; downloading {NIFTY_BENCHMARK_TICKER} …")
     data = yf.download(
@@ -330,73 +446,23 @@ def _safe_stem_from_ticker(ticker: str) -> str:
         .replace("/", "_")
         .replace("&", "_")
         .replace("-", "_")
-        .strip("_")
+        .rstrip("_")
     )
 
 
 def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    stock_paths = list_stock_parquet_files(RAW_DIR)
-    if not stock_paths:
-        raise FileNotFoundError(f"No stock parquet files found in: {RAW_DIR}")
+    bench_path = _download_benchmark_if_missing()
+    equity_paths = list_equity_input_paths(RAW_DIR)
+    if not equity_paths:
+        raise FileNotFoundError(f"No equity raw files found in: {RAW_DIR}")
 
-    _download_benchmark_if_missing()
-    nifty_df = _read_raw_parquet(NIFTY_BENCHMARK_PARQUET)
-
+    nifty_df = _read_raw_equity(bench_path)
     macro_data = load_macro_series(RAW_DIR)
 
-    for p in stock_paths:
-        df = _read_raw_parquet(p)
-        ticker = str(df["Ticker"].iloc[0]) if "Ticker" in df.columns and len(df) else p.stem
-
-        n_orig = len(df)
-        out = df.copy()
-
-        out = add_returns_features(out)
-        out = add_realized_vol_20(out)
-        out = add_rsi_14(out)
-        out = add_bollinger_distance(out)
-        out = add_volume_surge(out)
-        out = add_macro_lagged_returns(out, macro_data)
-        out = compute_monthly_alpha_adjclose(out, nifty_df)
-        out = add_daily_target(out)
-        out = add_hmm_regime_full_history(out)
-
-        # Output columns (keep core prices for traceability; features are Adj Close based)
-        keep = [
-            "Date",
-            "Ticker",
-            "Open",
-            "High",
-            "Low",
-            "Close",
-            "Adj Close",
-            "Volume",
-            "Ret_1d",
-            "Ret_5d",
-            "Ret_21d",
-            "Realized_Vol_20",
-            "RSI_14",
-            "BB_Dist",
-            "Volume_Surge",
-        ] + [f"Macro_{k}_Ret1d_L1" for k in MACRO_TICKERS.keys()] + [
-            "Monthly_Alpha",
-            "Daily_Return",
-            "HMM_Regime",
-        ]
-
-        out = out[keep]
-        out = out.dropna(how="any")
-
-        if len(out) == 0:
-            print(f"[{ticker}] rows: {n_orig} original → 0 after dropna → [SKIP] empty features")
-            continue
-
-        out_path = PROCESSED_DIR / f"{_safe_stem_from_ticker(ticker)}_features.parquet"
-        out.to_parquet(out_path, index=False)
-
-        print(f"[{ticker}] rows: {n_orig} original → {len(out)} after dropna → saved {out_path.name}")
+    for p in equity_paths:
+        process_raw_equity_path(p, nifty_df, macro_data, PROCESSED_DIR)
 
 
 if __name__ == "__main__":

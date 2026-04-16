@@ -10,6 +10,10 @@ from models.ramt.dataset import (
     VOLUME_COLS,
 )
 
+# Extra gain on 21d log-return in the price branch (trend / momentum vs short-horizon noise).
+# Applied inside `forward` after the batch is split from X (post–RobustScaler at train/infer time).
+RET_21D_INPUT_SCALE = 1.65
+
 
 class FeedForwardEncoder(nn.Module):
     """Projects input_dim features per timestep to embed_dim."""
@@ -110,7 +114,9 @@ class MultimodalEncoder(nn.Module):
             x: (batch, seq_len, len(ALL_FEATURE_COLS)) — scaled features only
             regime: (batch,) int64 labels 0/1/2 (same regime broadcast across time)
         """
-        price_x = x[:, :, self.price_idx]
+        price_x = x[:, :, self.price_idx].clone()
+        # Ret_21d is last in PRICE_COLS — emphasize medium-horizon trend in the encoder input.
+        price_x[:, :, 2] = price_x[:, :, 2] * RET_21D_INPUT_SCALE
         tech_x = x[:, :, self.tech_idx]
         volume_x = x[:, :, self.volume_idx]
         macro_x = x[:, :, self.macro_idx]

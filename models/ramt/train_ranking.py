@@ -109,6 +109,8 @@ LAMBDA_DIR = 0.3
 NUM_HEADS = 8
 MODEL_DROPOUT = 0.2
 HIGH_VOL_SAMPLE_WEIGHT = 2.0  # regime 0
+# MarginRankingLoss margin: higher → model must separate leaders from the pack more aggressively.
+RANKING_MARGIN = 3.0
 
 
 def _safe_ticker_from_filename(fname: str) -> str:
@@ -250,7 +252,7 @@ def _pairwise_rank_loss(pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tenso
     return torch.nn.functional.softplus(-margin).mean()
 
 
-def _margin_rank_loss(pred: torch.Tensor, y_true: torch.Tensor, margin: float = 2.0) -> torch.Tensor:
+def _margin_rank_loss(pred: torch.Tensor, y_true: torch.Tensor, margin: float = RANKING_MARGIN) -> torch.Tensor:
     """
     MarginRankingLoss for a rebalance-date group.
 
@@ -393,7 +395,7 @@ def _train_one_epoch(
             m = db == d
             if int(m.sum()) >= 4:
                 gw = time_w[m].mean().clamp_min(1e-8)
-                rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=2.0) * gw)
+                rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=RANKING_MARGIN) * gw)
                 rank_w.append(gw)
         if rank_losses:
             rank_loss = torch.stack(rank_losses).sum() / (torch.stack(rank_w).sum() + 1e-8)
@@ -452,7 +454,7 @@ def _eval_loss(model, loader, criterion):
                 m = db == d
                 if int(m.sum()) >= 4:
                     gw = time_w[m].mean().clamp_min(1e-8)
-                    rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=2.0) * gw)
+                    rank_losses.append(_margin_rank_loss(pred_m[m], yb_m[m], margin=RANKING_MARGIN) * gw)
                     rank_w.append(gw)
             if rank_losses:
                 rank_loss = torch.stack(rank_losses).sum() / (torch.stack(rank_w).sum() + 1e-8)

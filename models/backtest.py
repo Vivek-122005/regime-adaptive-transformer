@@ -4,9 +4,9 @@ Portfolio Backtest 2015-2024
 Monthly rebalancing strategy:
 1. First trading day of month
 2. Check HMM regime
-3. If BULL: buy top 5 RAMT-ranked stocks
-4. If HIGH_VOL: buy top 3
-5. If BEAR: cash
+3. If BULL: top N RAMT-ranked stocks at 100% allocation
+4. If HIGH_VOL: top 3 at 50% allocation
+5. If BEAR: top 5 at 20% allocation (5% one-period loss floor on portfolio return)
 6. Hold until next month
 7. Repeat
 
@@ -59,8 +59,8 @@ def ensure_nifty_features_parquet(processed_dir: str | Path, raw_dir: str | Path
     """
     Return path to ``_NSEI_features.parquet``, building it if missing.
 
-    The bulk ``feature_engineering`` loop excludes the index; the backtest still
-    needs ``HMM_Regime`` aligned to NIFTY dates.
+    Uses the same pipeline as ``features.feature_engineering`` so the index file has
+    the full feature column set (including ``HMM_Regime``) as stock files.
     """
     pdir = Path(processed_dir)
     rdir = Path(raw_dir)
@@ -69,20 +69,26 @@ def ensure_nifty_features_parquet(processed_dir: str | Path, raw_dir: str | Path
         return str(out)
 
     pdir.mkdir(parents=True, exist_ok=True)
-    df = _load_nifty_benchmark_raw(rdir)
 
     from features.feature_engineering import (
-        add_hmm_regime_full_history,
-        add_realized_vol_20,
-        add_returns_features,
+        _download_benchmark_if_missing,
+        _read_raw_equity,
+        load_macro_series,
+        process_raw_equity_path,
     )
 
-    df = add_returns_features(df)
-    df = add_realized_vol_20(df)
-    df = add_hmm_regime_full_history(df)
-    slim = df[["Date", "HMM_Regime"]].dropna(subset=["HMM_Regime"])
-    slim.to_parquet(out, index=False)
-    return str(out)
+    bench_path = _download_benchmark_if_missing()
+    if not bench_path.exists():
+        raise FileNotFoundError(
+            f"Cannot build NIFTY features: missing benchmark Parquet/CSV under {rdir}"
+        )
+
+    nifty_df = _read_raw_equity(bench_path)
+    macro_data = load_macro_series(rdir)
+    _, written = process_raw_equity_path(bench_path, nifty_df, macro_data, pdir)
+    if written is None or not written.exists():
+        raise RuntimeError("Failed to materialize _NSEI_features.parquet from raw NIFTY data.")
+    return str(written.resolve())
 
 
 def resolve_nifty_features_path(nifty_features_path: str, raw_dir: str) -> str:
@@ -216,27 +222,15 @@ def run_backtest(
             continue
         regime = int(month_regime[0])
 
-        if regime == 2:  # Bear
-            position_size = 0.0
-            top_n_regime = 0
+        if regime == 2:  # Bear — fractional toe-hold + loss floor (trailing-stop proxy)
+            position_size = 0.2
+            top_n_regime = min(5, top_n)
         elif regime == 0:  # High vol
             position_size = 0.5
             top_n_regime = 3
         else:  # Bull
             position_size = 1.0
             top_n_regime = top_n
-
-        if position_size == 0.0:
-            results.append(
-                {
-                    "date": date,
-                    "portfolio_return": 0.0,
-                    "regime": "BEAR",
-                    "stocks_held": [],
-                    "cash": True,
-                }
-            )
-            continue
 
         month_preds = predictions_df[predictions_df["Date"] == date].nlargest(
             top_n_regime, "predicted_alpha"
@@ -246,6 +240,8 @@ def run_backtest(
 
         actual_returns = month_preds["actual_alpha"].values.astype(float)
         portfolio_return = float(np.mean(actual_returns) * position_size)
+        if regime == 2:
+            portfolio_return = float(max(portfolio_return, -0.05))
 
         results.append(
             {
@@ -294,6 +290,7 @@ def run_backtest_daily(
     top_n: int = 5,
     capital: float = 100000,
     stop_loss: float = 0.07,
+    stop_loss_bear: float = 0.05,
     max_weight: float = 0.20,
     portfolio_dd_cash_trigger: float = 0.15,
     trade_cost_bps: float = 15.0,
@@ -304,7 +301,7 @@ def run_backtest_daily(
     Daily-price backtest with risk rules.
 
     - Rebalance every `step_size` trading days on NIFTY calendar.
-    - Stop-loss per stock (intramonth): exit at -stop_loss and hold cash.
+    - Stop-loss per stock (intraperiod): ``stop_loss`` by default; in BEAR use ``stop_loss_bear`` (5%).
     - Max weight per stock: cap at `max_weight`, remainder stays cash.
     - If portfolio return <= -portfolio_dd_cash_trigger in a window:
         force next window to cash.
@@ -349,28 +346,32 @@ def run_backtest_daily(
 
         regime = int(regime_df.loc[:d0].iloc[-1]) if not regime_df.loc[:d0].empty else 1
         if forced_cash_next:
-            regime = 2
-            forced_cash_next = False
-
-        if regime == 2:
             results.append(
                 {
                     "date": d0,
                     "portfolio_return": 0.0,
-                    "regime": "BEAR",
+                    "regime": "RISK_OFF",
                     "stocks_held": [],
                     "cash": True,
                     "portfolio_value": pv,
                 }
             )
+            forced_cash_next = False
+            prev_holdings = set()
             continue
 
-        if regime == 0:
+        if regime == 2:
+            position_size = 0.2
+            n_sel = min(5, top_n)
+            sl_stock = stop_loss_bear
+        elif regime == 0:
             position_size = 0.5
             n_sel = 3
+            sl_stock = stop_loss
         else:
             position_size = 1.0
             n_sel = top_n
+            sl_stock = stop_loss
 
         month_df = preds[preds["Date"] == d0].copy()
         if month_df.empty:
@@ -443,8 +444,8 @@ def run_backtest_daily(
             entry = float(window.iloc[0])
             # stop-loss check
             min_px = float(window.min())
-            if (min_px / entry - 1.0) <= -stop_loss:
-                stock_rets.append(-stop_loss)
+            if (min_px / entry - 1.0) <= -sl_stock:
+                stock_rets.append(-sl_stock)
                 stopped.append(t)
             else:
                 exit_px = float(window.iloc[-1])
@@ -453,6 +454,8 @@ def run_backtest_daily(
         gross_stock_ret = float(np.mean(stock_rets)) if stock_rets else 0.0
         port_ret_gross = invested * gross_stock_ret  # cash returns 0
         port_ret = port_ret_gross - (friction_cost / pv if pv > 0 else 0.0)
+        if regime == 2:
+            port_ret = float(max(port_ret, -0.05))
 
         if port_ret <= -portfolio_dd_cash_trigger:
             forced_cash_next = True
