@@ -4,7 +4,7 @@ RAMT — Full Model Architecture
 Complete forward pass:
 1. MultimodalEncoder  → (batch, seq_len, 64)
 2. PositionalEncoding → (batch, seq_len, 64)
-3. MixtureOfExperts   → (batch, 1) prediction
+3. MixtureOfExperts   → (batch, embed_dim) context embedding
                         (batch, 3) gate weights
 
 Regime conditioning flows through:
@@ -16,6 +16,7 @@ Both use the same HMM_Regime signal.
 import torch
 import torch.nn as nn
 
+from models.ramt.dataset import ALL_FEATURE_COLS
 from models.ramt.encoder import MultimodalEncoder
 from models.ramt.moe import MixtureOfExperts, PositionalEncoding
 
@@ -26,11 +27,11 @@ class RAMTModel(nn.Module):
 
     Architecture summary:
 
-    Input: (batch, seq_len=30, num_features=27)
+    Input: (batch, seq_len=30, num_features=len(ALL_FEATURE_COLS))
            + regime (batch,) integer 0/1/2
 
     Step 1 — MultimodalEncoder:
-      Split 27 features into 7 groups
+      Split features into price / tech / volume / macro + regime + ticker
       Encode each group separately
       Fuse into (batch, seq_len, embed_dim=64)
 
@@ -42,8 +43,12 @@ class RAMTModel(nn.Module):
     Step 3 — MixtureOfExperts:
       3 Transformer experts process the sequence
       GatingNetwork blends based on regime
-      Output: (batch, 1) prediction
+      Output: (batch, embed_dim) context embedding
               (batch, 3) gate weights
+
+    Step 4 — Dual heads ("dual-brain"):
+      Monthly head: predict Monthly_Alpha / Monthly_Alpha_Z (ranking signal)
+      Daily head:   predict next-day Log_Return (sanity-check signal)
 
     Output: prediction (batch, 1)
             gate_weights (batch, 3) — for interpretability
@@ -71,6 +76,7 @@ class RAMTModel(nn.Module):
         num_regimes=3,
         seq_len=30,
         dropout=0.1,
+        explainable_attn: bool = False,
     ):
         super().__init__()
 
@@ -91,7 +97,7 @@ class RAMTModel(nn.Module):
             dropout=dropout,
         )
 
-        # Step 3: Mixture of Experts
+        # Step 3: Mixture of Experts (returns fused context embedding)
         self.moe = MixtureOfExperts(
             embed_dim=embed_dim,
             num_heads=num_heads,
@@ -100,6 +106,24 @@ class RAMTModel(nn.Module):
             num_experts=num_experts,
             num_regimes=num_regimes,
             dropout=dropout,
+            explainable_attn=explainable_attn,
+        )
+
+        # Step 4: Dual heads
+        head_hidden = embed_dim // 2
+        self.monthly_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, head_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
+        )
+        self.daily_head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, head_hidden),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(head_hidden, 1),
         )
 
     def forward(self, x, regime, ticker_id=None):
@@ -107,7 +131,7 @@ class RAMTModel(nn.Module):
         Full RAMT forward pass.
 
         Args:
-            x:      (batch, seq_len, 27) scaled feature tensor
+            x:      (batch, seq_len, F) scaled feature tensor (F = len(ALL_FEATURE_COLS))
             regime: (batch,) integer regime labels 0/1/2
 
         Returns:
@@ -116,7 +140,7 @@ class RAMTModel(nn.Module):
         """
         # Step 1: Encode each feature group separately
         # then fuse into unified representation
-        encoded = self.encoder(x, ticker_id=ticker_id)
+        encoded = self.encoder(x, regime, ticker_id=ticker_id)
         # encoded: (batch, seq_len, embed_dim=64)
 
         # Step 2: Add positional information
@@ -124,12 +148,15 @@ class RAMTModel(nn.Module):
         positioned = self.pos_encoding(encoded)
         # positioned: (batch, seq_len, embed_dim=64)
 
-        # Step 3: Route through regime-specialized experts
-        prediction, gate_weights = self.moe(positioned, regime)
-        # prediction:   (batch, 1)
+        # Step 3: Route through regime-specialized experts -> context embedding
+        context, gate_weights = self.moe(positioned, regime)
+        # context: (batch, embed_dim)
         # gate_weights: (batch, num_experts)
 
-        return prediction, gate_weights
+        pred_monthly = self.monthly_head(context)
+        pred_daily = self.daily_head(context)
+
+        return pred_monthly, pred_daily, gate_weights
 
     def count_parameters(self):
         """Return total trainable parameter count."""
@@ -156,6 +183,7 @@ def build_ramt(config=None):
         "num_regimes": 3,
         "seq_len": 30,
         "dropout": 0.1,
+        "explainable_attn": False,
     }
     if config:
         defaults.update(config)
@@ -185,26 +213,29 @@ if __name__ == "__main__":
     print("\n--- Test 1: Forward Pass (random data) ---")
     batch_size = 16
     seq_len = 30
-    num_features = 27
+    num_features = len(ALL_FEATURE_COLS)
 
     x = torch.randn(batch_size, seq_len, num_features).to(device)
     regime = torch.randint(0, 3, (batch_size,)).to(device)
 
-    pred, weights = model(x, regime)
+    pred_m, pred_d, weights = model(x, regime)
 
-    assert pred.shape == (batch_size, 1), (
-        f"Expected ({batch_size}, 1) got {pred.shape}"
+    assert pred_m.shape == (batch_size, 1), (
+        f"Expected ({batch_size}, 1) got {pred_m.shape}"
+    )
+    assert pred_d.shape == (batch_size, 1), (
+        f"Expected ({batch_size}, 1) got {pred_d.shape}"
     )
     assert weights.shape == (batch_size, 3), (
         f"Expected ({batch_size}, 3) got {weights.shape}"
     )
-    assert not torch.isnan(pred).any(), "NaN in predictions!"
+    assert not torch.isnan(pred_m).any(), "NaN in predictions!"
     assert not torch.isnan(weights).any(), "NaN in gate weights!"
 
     print(f"Input shape:       {x.shape}")
-    print(f"Prediction shape:  {pred.shape}")
+    print(f"Monthly pred shape: {pred_m.shape}")
     print(f"Gate weights shape:{weights.shape}")
-    print(f"Predictions range: [{pred.min():.4f}, {pred.max():.4f}]")
+    print(f"Predictions range: [{pred_m.min():.4f}, {pred_m.max():.4f}]")
     print("Forward Pass: PASSED")
 
     # Test with real data
@@ -222,11 +253,11 @@ if __name__ == "__main__":
     X_batch = X_batch.to(device)
     r_batch = r_batch.squeeze(-1).to(device)
 
-    pred_real, weights_real = model(X_batch, r_batch)
+    pred_m_real, _pred_d_real, weights_real = model(X_batch, r_batch)
 
-    assert not torch.isnan(pred_real).any()
+    assert not torch.isnan(pred_m_real).any()
     print(f"Real input shape:  {X_batch.shape}")
-    print(f"Real pred shape:   {pred_real.shape}")
+    print(f"Real pred shape:   {pred_m_real.shape}")
     print(f"Regime values:     {r_batch.tolist()[:8]}")
     print("Gate weights sample:")
     for i in range(3):
@@ -246,7 +277,7 @@ if __name__ == "__main__":
     criterion = CombinedLoss(lambda_dir=0.3)
     y_true = y_batch.to(device)
 
-    total_loss, mse_loss, dir_loss = criterion(pred_real, y_true)
+    total_loss, mse_loss, dir_loss = criterion(pred_m_real, y_true)
 
     assert not torch.isnan(total_loss)
     print(f"Total loss:       {total_loss.item():.6f}")
@@ -259,7 +290,7 @@ if __name__ == "__main__":
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
 
     optimizer.zero_grad()
-    pred_bp, _ = model(X_batch, r_batch)
+    pred_bp, _pd, _gw = model(X_batch, r_batch)
     loss, _, _ = criterion(pred_bp, y_true)
     loss.backward()
 

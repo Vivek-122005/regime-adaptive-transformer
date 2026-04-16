@@ -34,6 +34,14 @@ There is also a derived label:
 - **`Beat_NIFTY`** = 1 if `Monthly_Alpha > 0` else 0  
 This is **not** used as the training target in the current pipeline (it’s saved for analysis).
 
+### Risk-adjusted target (new)
+
+We also compute an optional, more “production friendly” target:
+
+- **`Monthly_Alpha_Z`** = `Monthly_Alpha / (trailing 21d volatility)`
+
+This penalizes very volatile “junk” outperformers and tends to prefer smoother outperformance.
+
 ---
 
 ## 2) What features are fed into the model?
@@ -107,7 +115,7 @@ Computed as 1d and 5d log-return sums for each macro series:
 Feature engineering creates raw numeric columns.
 
 Scaling happens at training time:
-- The `StandardScaler` is **fit on training rows only** and applied to val/test rows in `models/ramt/dataset.py` (`RAMTDataModule.get_fold_loaders`).
+- **`RobustScaler`** (IQR-based) is **fit on training rows only** for features and the monthly alpha label. For the combined NIFTY200 trainer, `transform` runs inside `LazyMultiTickerSequenceDataset.__getitem__` so val/test/inference never reuse training-only statistics implicitly. Single-ticker loaders still use `RAMTDataModule.get_fold_loaders` in `models/ramt/dataset.py`.
 
 ---
 

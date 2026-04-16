@@ -3,6 +3,37 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class ExplainableTransformerEncoderLayer(nn.TransformerEncoderLayer):
+    """
+    Drop-in replacement for nn.TransformerEncoderLayer that stores attention weights.
+
+    Important: We keep the exact same parameter structure as PyTorch's built-in
+    TransformerEncoderLayer, so state_dict keys remain compatible.
+
+    After a forward pass, the most recent self-attention weights are available at:
+      self.last_attn_weights  # shape: (batch, heads, tgt_len, src_len)
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.last_attn_weights = None
+
+    def _sa_block(self, x, attn_mask, key_padding_mask, is_causal: bool = False):
+        # Request per-head weights (average_attn_weights=False)
+        attn_output, attn_weights = self.self_attn(
+            x,
+            x,
+            x,
+            attn_mask=attn_mask,
+            key_padding_mask=key_padding_mask,
+            need_weights=True,
+            average_attn_weights=False,
+            is_causal=is_causal,
+        )
+        self.last_attn_weights = attn_weights
+        return self.dropout1(attn_output)
+
+
 class PositionalEncoding(nn.Module):
     """
     Learnable positional encoding for Transformer.
@@ -53,13 +84,10 @@ class ExpertTransformer(nn.Module):
 
     Architecture:
         TransformerEncoder (2 layers, 4 heads)
-        Pool last timestep
-        LayerNorm
-        Linear(embed_dim -> hidden_dim) -> ReLU -> Dropout
-        Linear(hidden_dim -> 1)
+        Return the last-timestep embedding (batch, embed_dim)
 
     Input:  (batch, seq_len, embed_dim)
-    Output: (batch, 1) - return prediction
+    Output: (batch, embed_dim) - shared representation
     """
 
     def __init__(
@@ -69,10 +97,12 @@ class ExpertTransformer(nn.Module):
         num_layers=2,
         dim_feedforward=128,
         dropout=0.1,
+        explainable_attn: bool = False,
     ):
         super().__init__()
 
-        encoder_layer = nn.TransformerEncoderLayer(
+        layer_cls = ExplainableTransformerEncoderLayer if explainable_attn else nn.TransformerEncoderLayer
+        encoder_layer = layer_cls(
             d_model=embed_dim,
             nhead=num_heads,
             dim_feedforward=dim_feedforward,
@@ -81,16 +111,7 @@ class ExpertTransformer(nn.Module):
             norm_first=True,  # Pre-norm (more stable training)
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # Output head
-        hidden_dim = embed_dim // 2  # 32
-        self.head = nn.Sequential(
-            nn.LayerNorm(embed_dim),
-            nn.Linear(embed_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, 1),
-        )
+        self.explainable_attn = explainable_attn
 
     def forward(self, x):
         # x: (batch, seq_len, embed_dim)
@@ -103,8 +124,25 @@ class ExpertTransformer(nn.Module):
         last = out[:, -1, :]
         # last: (batch, embed_dim)
 
-        return self.head(last)
-        # output: (batch, 1)
+        return last
+        # output: (batch, embed_dim)
+
+    def get_last_attn_stack(self) -> list[torch.Tensor]:
+        """
+        Return attention weights from each encoder layer (if explainable_attn=True).
+        Each element is a tensor with shape (batch, heads, tgt_len, src_len).
+        """
+        if not self.explainable_attn:
+            return []
+        layers = getattr(self.transformer, "layers", None)
+        if layers is None:
+            return []
+        out: list[torch.Tensor] = []
+        for lyr in layers:
+            w = getattr(lyr, "last_attn_weights", None)
+            if w is not None:
+                out.append(w)
+        return out
 
 
 class GatingNetwork(nn.Module):
@@ -222,7 +260,7 @@ class MixtureOfExperts(nn.Module):
 
     Input:  x (batch, seq_len, embed_dim)
             regime (batch,) integers 0/1/2
-    Output: prediction (batch, 1)
+    Output: fused_context (batch, embed_dim)
             gate_weights (batch, num_experts) for analysis
     """
 
@@ -235,10 +273,12 @@ class MixtureOfExperts(nn.Module):
         num_experts=3,
         num_regimes=3,
         dropout=0.1,
+        explainable_attn: bool = False,
     ):
         super().__init__()
 
         self.num_experts = num_experts
+        self.explainable_attn = explainable_attn
 
         # Create N independent expert Transformers
         # Each has identical architecture but separate weights
@@ -250,6 +290,7 @@ class MixtureOfExperts(nn.Module):
                     num_layers=num_layers,
                     dim_feedforward=dim_feedforward,
                     dropout=dropout,
+                    explainable_attn=explainable_attn,
                 )
                 for _ in range(num_experts)
             ]
@@ -273,7 +314,7 @@ class MixtureOfExperts(nn.Module):
             gating_context: optional (batch, embed_dim) context override
                             for gating. If None, uses x[:, -1, :].
         Returns:
-            prediction:   (batch, 1)
+            fused_context: (batch, embed_dim)
             gate_weights: (batch, num_experts)
         """
         # Get context from last timestep for gating
@@ -284,27 +325,39 @@ class MixtureOfExperts(nn.Module):
         gate_weights = self.gating(context, regime)
         # gate_weights: (batch, num_experts)
 
-        # Run all experts independently
-        expert_outputs = []
+        # Run all experts independently (return context embeddings)
+        expert_outputs: list[torch.Tensor] = []
         for expert in self.experts:
             out = expert(x)
-            # out: (batch, 1)
+            # out: (batch, embed_dim)
             expert_outputs.append(out)
 
         # Stack expert outputs
         expert_stack = torch.stack(expert_outputs, dim=1)
-        # expert_stack: (batch, num_experts, 1)
+        # expert_stack: (batch, num_experts, embed_dim)
 
         # Weighted blend using gate weights
         # gate_weights: (batch, num_experts)
         # Unsqueeze for broadcasting: (batch, num_experts, 1)
         weights = gate_weights.unsqueeze(-1)
 
-        # Weighted sum across experts
-        prediction = (weights * expert_stack).sum(dim=1)
-        # prediction: (batch, 1)
+        # Weighted sum across experts -> fused context
+        fused_context = (weights * expert_stack).sum(dim=1)
+        # fused_context: (batch, embed_dim)
 
-        return prediction, gate_weights
+        return fused_context, gate_weights
+
+    def get_last_attention(self) -> list[list[torch.Tensor]]:
+        """
+        Returns per-expert attention stacks (list of layers) from the last forward pass.
+        Shape per tensor: (batch, heads, tgt_len, src_len).
+        """
+        if not self.explainable_attn:
+            return []
+        out: list[list[torch.Tensor]] = []
+        for e in self.experts:
+            out.append(e.get_last_attn_stack())
+        return out
 
 
 if __name__ == "__main__":

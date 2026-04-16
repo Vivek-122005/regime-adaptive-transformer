@@ -1,9 +1,14 @@
 """
 RAMT Data Pipeline — Step 2: Feature Engineering
-Transforms raw OHLCV data into a 36-feature matrix per ticker.
-Feature groups: lagged returns, volatility, technical indicators,
-momentum, volume, HMM regime labels, cross-asset correlation.
-Saves processed CSVs to data/processed/.
+Transforms raw OHLCV(+Adj Close) data into a feature matrix per ticker.
+
+This version is refactored for the NIFTY 200 Parquet-based raw store:
+- Batch-process all stock Parquet files in `data/raw/`.
+- Compute returns (log) over 1d, 5d, 21d using **Adj Close**.
+- Compute technicals: RSI(14), Bollinger Band distance, Volume Surge (Vol / SMA20 Vol).
+- Merge macro series (INDIAVIX, CRUDE, USDINR, SP500) using 1-day lagged returns (no leakage).
+- Target: Monthly_Alpha = ln(P_{t+21}/P_t) - ln(N_{t+21}/N_t), using **Adj Close**.
+- Output: `data/processed/{ticker}_features.parquet` (no CSV).
 """
 
 from __future__ import annotations
@@ -25,438 +30,28 @@ if not (PROJECT_ROOT / "data" / "raw").exists():
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
 
-NIFTY_RAW_FILENAME = "_NSEI_raw.csv"
+START_DATE = "2015-01-01"
+# yfinance end is exclusive; to include 2026-04-15 use 2026-04-16.
+END_DATE_EXCLUSIVE = "2026-04-16"
 
+# Benchmark used in Monthly_Alpha.
+NIFTY_BENCHMARK_TICKER = "^NSEI"
+NIFTY_BENCHMARK_PARQUET = RAW_DIR / "_NSEI.parquet"
 
-def list_stock_raw_files(raw_dir: Path) -> list[str]:
-    """
-    Return raw OHLCV CSVs to process as individual stocks.
+# Macro series (names expected by the acquisition script).
+MACRO_TICKERS: dict[str, str] = {
+    "INDIAVIX": "^INDIAVIX",
+    "CRUDE": "CL=F",
+    "USDINR": "INR=X",
+    "SP500": "^GSPC",
+}
 
-    Excludes:
-    - NIFTY benchmark raw file (used for relative momentum + target)
-    - Macro series files (macro_*)
-    """
-    out: list[str] = []
-    for p in sorted(raw_dir.glob("*_raw.csv")):
-        name = p.name
-        if name == NIFTY_RAW_FILENAME:
-            continue
-        if name.startswith("macro_"):
-            continue
-        out.append(name)
-    return out
-
-LAG_DAYS = [1, 2, 3, 5, 10, 20]
-
-# Indian listings use NIFTY; US (JPM) uses S&P 500
-INDIAN_TICKER_SUBSTR = ".NS"
-
+# Required columns in raw parquet files created by scripts/fetch_nifty200.py
+RAW_REQUIRED_COLS = ["Date", "Open", "High", "Low", "Close", "Adj Close", "Volume"]
 
 # -----------------------------------------------------------------------------
-# Group 1 — Lagged Returns
+# Helpers
 # -----------------------------------------------------------------------------
-
-
-def add_lagged_returns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add lagged log-return columns so the model can use recent return history.
-
-    For each n in {1,2,3,5,10,20}, Return_Lag_n is Log_Return shifted by n trading
-    days (memory of past shocks).
-    """
-    out = df.copy()
-    for n in LAG_DAYS:
-        out[f"Return_Lag_{n}"] = out["Log_Return"].shift(n)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 2 — Volatility Features
-# -----------------------------------------------------------------------------
-
-
-def add_volatility_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add realized volatility horizons, Garman–Klass range-based volatility, and
-    short/long vol ratio to capture volatility level and regime shifts.
-    """
-    out = df.copy()
-    lr = out["Log_Return"]
-    out["Realized_Vol_5"] = lr.rolling(5).std()
-    out["Realized_Vol_20"] = lr.rolling(20).std()
-    out["Realized_Vol_60"] = lr.rolling(60).std()
-
-    hl = np.log(out["High"] / out["Low"])
-    co = np.log(out["Close"] / out["Open"])
-    out["Garman_Klass_Vol"] = 0.5 * (hl**2) - (2 * np.log(2.0) - 1.0) * (co**2)
-
-    out["Vol_Ratio"] = out["Realized_Vol_5"] / out["Realized_Vol_20"]
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 3 — Technical Indicators (manual)
-# -----------------------------------------------------------------------------
-
-
-def add_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add RSI (Wilder), MACD stack, and Bollinger Band level/squeeze/position
-    without TA-Lib — momentum, trend, and mean-reversion context.
-    """
-    out = df.copy()
-    close = out["Close"]
-
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    alpha_rsi = 1.0 / 14.0
-    avg_gain = gain.ewm(alpha=alpha_rsi, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=alpha_rsi, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0.0, np.nan)
-    out["RSI_14"] = 100.0 - (100.0 / (1.0 + rs))
-    out.loc[avg_loss == 0.0, "RSI_14"] = 100.0
-
-    ema12 = close.ewm(span=12, adjust=False).mean()
-    ema26 = close.ewm(span=26, adjust=False).mean()
-    out["MACD"] = ema12 - ema26
-    out["MACD_Signal"] = out["MACD"].ewm(span=9, adjust=False).mean()
-    out["MACD_Hist"] = out["MACD"] - out["MACD_Signal"]
-
-    ma20 = close.rolling(20).mean()
-    std20 = close.rolling(20).std()
-    out["BB_Upper"] = ma20 + 2.0 * std20
-    out["BB_Lower"] = ma20 - 2.0 * std20
-    bb_mid = ma20.replace(0.0, np.nan)
-    out["BB_Width"] = (out["BB_Upper"] - out["BB_Lower"]) / bb_mid
-    band = out["BB_Upper"] - out["BB_Lower"]
-    out["BB_Position"] = (close - out["BB_Lower"]) / band.replace(0.0, np.nan)
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 4 — Momentum and Reversal
-# -----------------------------------------------------------------------------
-
-
-def add_momentum(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add multi-horizon price momentum and rate-of-change to capture trend
-    persistence and short-term reversal.
-    """
-    out = df.copy()
-    c = out["Close"]
-    out["Momentum_5"] = c / c.shift(5) - 1.0
-    out["Momentum_20"] = c / c.shift(20) - 1.0
-    out["Momentum_60"] = c / c.shift(60) - 1.0
-    out["ROC_10"] = (c - c.shift(10)) / c.shift(10)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 5 — Volume Features
-# -----------------------------------------------------------------------------
-
-
-def add_volume_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add volume relative to its recent average (unusual activity) and log volume
-    to tame heavy-tailed volume skew.
-    """
-    out = df.copy()
-    vol = out["Volume"]
-    out["Volume_MA_Ratio"] = vol / vol.rolling(20).mean()
-    out["Volume_Log"] = np.log(vol + 1.0)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 6 — HMM Regime Labels
-# -----------------------------------------------------------------------------
-
-
-def _semantic_hmm_mapping(mean_by_state: dict[int, float]) -> dict[int, tuple[int, str]]:
-    """
-    Map raw HMM states to semantic regime codes and labels from mean log return.
-
-    Highest mean return → bull (1), lowest → bear (2), middle → high_vol (0).
-    """
-    states = sorted(mean_by_state.keys(), key=lambda s: mean_by_state[s])
-    low, mid, high = states[0], states[1], states[2]
-    return {
-        high: (1, "bull"),
-        low: (2, "bear"),
-        mid: (0, "high_vol"),
-    }
-
-
-def add_hmm_regimes(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Fit a 3-state Gaussian HMM on [Log_Return, Realized_Vol_20] per ticker,
-    assign each day a regime, then remap raw states to bull/bear/high_vol using
-    mean log return ordering — captures latent market regimes for conditioning.
-    """
-    out = df.copy()
-    lr = out["Log_Return"]
-    rv20 = out["Realized_Vol_20"]
-    mask = lr.notna() & rv20.notna()
-    X = np.column_stack([lr[mask].to_numpy(dtype=float), rv20[mask].to_numpy(dtype=float)])
-
-    out["HMM_Regime"] = np.nan
-    out["HMM_Regime_Label"] = pd.Series(index=out.index, dtype=object)
-
-    if len(X) < 30:
-        return out
-
-    lr_vals = lr[mask].to_numpy(dtype=float)
-    rv_vals = rv20[mask].to_numpy(dtype=float)
-    X_raw = np.column_stack([lr_vals, rv_vals])
-    mu = X_raw.mean(axis=0)
-    sigma = X_raw.std(axis=0)
-    sigma = np.where(sigma == 0.0, 1.0, sigma)
-    X_scaled = (X_raw - mu) / sigma
-
-    hmm = GaussianHMM(
-        n_components=3,
-        covariance_type="diag",
-        n_iter=200,
-        tol=1e-4,
-        random_state=42,
-        verbose=False,
-    )
-    hmm.fit(X_scaled)
-    raw_states = hmm.predict(X_scaled)
-    idx = out.index[mask]
-
-    if hasattr(hmm, "monitor_") and hmm.monitor_ is not None and not hmm.monitor_.converged:
-        print(
-            f"  [WARNING] HMM did not converge for {ticker} — regime labels may be unreliable"
-        )
-
-    means: dict[int, float] = {}
-    for k in (0, 1, 2):
-        sel = raw_states == k
-        if np.any(sel):
-            means[k] = float(np.mean(lr_vals[sel]))
-        else:
-            means[k] = float("nan")
-
-    raw_to_semantic = _semantic_hmm_mapping(means)
-    for row_i, row_idx in enumerate(idx):
-        raw_s = int(raw_states[row_i])
-        sem_code, label = raw_to_semantic[raw_s]
-        out.loc[row_idx, "HMM_Regime"] = sem_code
-        out.loc[row_idx, "HMM_Regime_Label"] = label
-
-    # Regime distribution (semantic labels)
-    valid = out.loc[idx, "HMM_Regime_Label"].dropna()
-    counts = valid.value_counts(normalize=True) * 100.0
-    print(f"  [{ticker}] HMM regime distribution (% of days):")
-    for name in ("bull", "bear", "high_vol"):
-        pct = counts.get(name, 0.0)
-        print(f"    {name}: {pct:.2f}%")
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 7 — Cross-Asset Correlation
-# -----------------------------------------------------------------------------
-
-
-def add_cross_asset_correlation(
-    df: pd.DataFrame,
-    ticker: str,
-    index_returns: dict[str, pd.Series],
-) -> pd.DataFrame:
-    """
-    Add 60-day rolling correlation of the stock's log returns with a broad index
-    (NIFTY for Indian names, S&P 500 for JPM) — measures equity–macro linkage.
-    """
-    out = df.copy()
-    sym = str(out["Ticker"].iloc[0])
-    if INDIAN_TICKER_SUBSTR in sym:
-        key = "^NSEI"
-    else:
-        key = "^GSPC"
-
-    idx_ret = index_returns[key].reindex(pd.to_datetime(out["Date"])).ffill()
-    idx_ret.index = out.index
-    stock_r = out["Log_Return"]
-    out["Rolling_Corr_Index"] = stock_r.rolling(60).corr(idx_ret)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 8 — Relative Momentum (vs NIFTY 50)
-# -----------------------------------------------------------------------------
-
-
-def add_relative_momentum(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Momentum relative to NIFTY 50 benchmark.
-    These are the most important ranking features.
-
-    Relative momentum = stock return - NIFTY return
-    over multiple lookback periods.
-
-    Stocks beating NIFTY consistently = strong candidates
-    """
-    out = df.copy()
-
-    aligned = out.join(
-        nifty_df[["Log_Return"]].rename(columns={"Log_Return": "NIFTY_Return"}),
-        how="left",
-    )
-    aligned["NIFTY_Return"] = aligned["NIFTY_Return"].fillna(0)
-
-    for window in [5, 21, 63, 126, 252]:
-        stock_cum = out["Log_Return"].rolling(window).sum()
-        nifty_cum = aligned["NIFTY_Return"].rolling(window).sum()
-        out[f"RelMom_{window}d"] = stock_cum - nifty_cum
-
-    mom_12 = out["Log_Return"].rolling(252).sum()
-    mom_1 = out["Log_Return"].rolling(21).sum()
-    out["Mom_12_1"] = mom_12 - mom_1
-
-    nifty_12 = aligned["NIFTY_Return"].rolling(252).sum()
-    nifty_1 = aligned["NIFTY_Return"].rolling(21).sum()
-    out["RelMom_12_1"] = (mom_12 - mom_1) - (nifty_12 - nifty_1)
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Group 9 — Macro Features
-# -----------------------------------------------------------------------------
-
-
-def add_macro_features(df: pd.DataFrame, macro_data: dict[str, pd.DataFrame]) -> pd.DataFrame:
-    """
-    Macro features that affect all Indian stocks.
-
-    USD/INR: affects IT stocks directly
-    Crude:   affects RELIANCE, BPCL, ONGC
-    VIX:     market fear indicator
-    Gold:    risk-off signal
-    """
-    out = df.copy()
-    for name, macro_df in macro_data.items():
-        col = f"Macro_{name}_Ret1d"
-        col5 = f"Macro_{name}_Ret5d"
-
-        ret = macro_df["Log_Return"].rename(col)
-        ret5 = macro_df["Log_Return"].rolling(5).sum().rename(col5)
-
-        out = out.join(ret, how="left")
-        out = out.join(ret5, how="left")
-        out[col] = out[col].fillna(0)
-        out[col5] = out[col5].fillna(0)
-
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Target — Monthly Alpha vs NIFTY
-# -----------------------------------------------------------------------------
-
-
-def compute_monthly_target(df: pd.DataFrame, nifty_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    TARGET VARIABLE — Monthly alpha vs NIFTY
-
-    OLD target: next day log return
-    NEW target: next 21 days stock return
-                minus next 21 days NIFTY return
-
-    Positive = stock beats NIFTY next month = BUY
-    Negative = stock underperforms NIFTY   = AVOID
-
-    This is what we are trying to predict.
-    Much more stable signal than daily returns.
-    """
-    out = df.copy()
-
-    stock_fwd = out["Log_Return"].rolling(21).sum().shift(-21)
-
-    aligned = out.join(
-        nifty_df[["Log_Return"]].rename(columns={"Log_Return": "NIFTY_Return"}),
-        how="left",
-    )
-    nifty_fwd = aligned["NIFTY_Return"].rolling(21).sum().shift(-21)
-
-    out["Monthly_Alpha"] = stock_fwd - nifty_fwd
-    out["Beat_NIFTY"] = (out["Monthly_Alpha"] > 0).astype(int)
-    return out
-
-
-# -----------------------------------------------------------------------------
-# Master pipeline
-# -----------------------------------------------------------------------------
-
-ENGINEERED_COLS = (
-    [f"Return_Lag_{n}" for n in LAG_DAYS]
-    + [
-        "Realized_Vol_5",
-        "Realized_Vol_20",
-        "Realized_Vol_60",
-        "Garman_Klass_Vol",
-        "Vol_Ratio",
-        "RSI_14",
-        "MACD",
-        "MACD_Signal",
-        "MACD_Hist",
-        "BB_Upper",
-        "BB_Lower",
-        "BB_Width",
-        "BB_Position",
-        "Momentum_5",
-        "Momentum_20",
-        "Momentum_60",
-        "ROC_10",
-        "Volume_MA_Ratio",
-        "Volume_Log",
-        "HMM_Regime",
-        "HMM_Regime_Label",
-        "Rolling_Corr_Index",
-    ]
-)
-
-BASE_COLS = ["Date", "Open", "High", "Low", "Close", "Volume", "Log_Return", "Ticker"]
-
-
-def process_ticker(
-    ticker: str,
-    df: pd.DataFrame,
-    index_returns: dict[str, pd.Series],
-    nifty_df: pd.DataFrame,
-    macro_data: dict[str, pd.DataFrame],
-) -> pd.DataFrame:
-    """
-    Run all feature groups in order and return the enriched frame (before global
-    dropna — caller drops NaNs and saves).
-    """
-    out = df.copy()
-    out = out.set_index("Date", drop=False)
-    out = add_lagged_returns(out)
-    out = add_volatility_features(out)
-    out = add_technical_indicators(out)
-    out = add_momentum(out)
-    out = add_volume_features(out)
-    out = add_hmm_regimes(out, ticker)
-    out = add_cross_asset_correlation(out, ticker, index_returns)
-    out = add_relative_momentum(out, nifty_df)
-    out = add_macro_features(out, macro_data)
-    out = compute_monthly_target(out, nifty_df)
-    return out
-
-
-def _output_stem_from_raw_filename(name: str) -> str:
-    stem = Path(name).stem
-    if stem.endswith("_raw"):
-        return stem[: -len("_raw")]
-    return stem
 
 
 def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -467,94 +62,341 @@ def _flatten_yfinance_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def download_index_returns(start: pd.Timestamp, end: pd.Timestamp) -> dict[str, pd.Series]:
+def list_stock_parquet_files(raw_dir: Path) -> list[Path]:
     """
-    Download ^NSEI and ^GSPC once, compute daily log returns aligned by calendar date.
+    Return stock raw Parquet files to process.
+
+    Excludes:
+    - Macro series files: macro_*.parquet
+    - Benchmark parquet: _NSEI.parquet (if present)
     """
-    tickers = ["^NSEI", "^GSPC"]
-    start_s = start.strftime("%Y-%m-%d")
-    end_s = (end + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    out: dict[str, pd.Series] = {}
-    for t in tickers:
-        data = yf.download(t, start=start_s, end=end_s, auto_adjust=True, progress=False)
-        data = _flatten_yfinance_columns(data)
-        px = data["Close"].dropna()
-        lr = np.log(px / px.shift(1))
-        lr.name = t
-        out[t] = lr
+    out: list[Path] = []
+    for p in sorted(raw_dir.glob("*.parquet")):
+        if p.name.startswith("macro_"):
+            continue
+        if p.name == NIFTY_BENCHMARK_PARQUET.name:
+            continue
+        out.append(p)
     return out
+
+
+def _read_raw_parquet(path: Path) -> pd.DataFrame:
+    df = pd.read_parquet(path)
+    missing = [c for c in RAW_REQUIRED_COLS if c not in df.columns]
+    if missing:
+        raise ValueError(f"{path.name}: missing columns {missing}; have {list(df.columns)}")
+    df = df.sort_values("Date").reset_index(drop=True)
+    df["Date"] = pd.to_datetime(df["Date"]).dt.tz_localize(None)
+    return df
+
+
+def _download_benchmark_if_missing() -> Path:
+    if NIFTY_BENCHMARK_PARQUET.exists():
+        return NIFTY_BENCHMARK_PARQUET
+
+    print(f"Benchmark parquet missing; downloading {NIFTY_BENCHMARK_TICKER} …")
+    data = yf.download(
+        NIFTY_BENCHMARK_TICKER,
+        start=START_DATE,
+        end=END_DATE_EXCLUSIVE,
+        interval="1d",
+        auto_adjust=False,
+        actions=False,
+        threads=False,
+        progress=False,
+    )
+    data = _flatten_yfinance_columns(data)
+    if data.empty:
+        raise RuntimeError(f"Failed to download benchmark: {NIFTY_BENCHMARK_TICKER}")
+    need = ["Open", "High", "Low", "Close", "Adj Close", "Volume"]
+    miss = [c for c in need if c not in data.columns]
+    if miss:
+        raise RuntimeError(f"Benchmark missing expected columns {miss}; have {list(data.columns)}")
+
+    out = data[need].copy().reset_index()
+    if "Date" not in out.columns:
+        out = out.rename(columns={out.columns[0]: "Date"})
+    out["Date"] = pd.to_datetime(out["Date"]).dt.tz_localize(None)
+    out.insert(0, "Ticker", NIFTY_BENCHMARK_TICKER)
+    NIFTY_BENCHMARK_PARQUET.parent.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(NIFTY_BENCHMARK_PARQUET, index=False)
+    return NIFTY_BENCHMARK_PARQUET
+
+
+def load_macro_series(raw_dir: Path) -> dict[str, pd.DataFrame]:
+    """
+    Load macro parquet files produced by scripts/fetch_nifty200.py and return
+    dict keyed by canonical names in MACRO_TICKERS.
+    """
+    macro_paths = list(sorted(raw_dir.glob("macro_*.parquet")))
+    if not macro_paths:
+        raise FileNotFoundError(f"No macro parquet files found in: {raw_dir}")
+
+    out: dict[str, pd.DataFrame] = {}
+    for p in macro_paths:
+        df = _read_raw_parquet(p)
+        # Macro parquet includes "Ticker" column; keep it but compute features from Adj Close.
+        # Heuristic mapping: prefer the first canonical name that appears in filename.
+        p_upper = p.name.upper()
+        matched = None
+        for nm in MACRO_TICKERS.keys():
+            if nm in p_upper:
+                matched = nm
+                break
+        if matched is None:
+            # fallback: take whatever after "macro_" until next "_" (still deterministic)
+            matched = p.name.split("macro_", 1)[1].split("_", 1)[0].upper()
+
+        out[matched] = df.set_index("Date", drop=False)
+
+    missing = [k for k in MACRO_TICKERS.keys() if k not in out]
+    if missing:
+        raise FileNotFoundError(
+            f"Missing required macro series {missing}. Found: {sorted(out.keys())}. "
+            f"Expected files for {sorted(MACRO_TICKERS.keys())} in {raw_dir}."
+        )
+    return out
+
+
+# -----------------------------------------------------------------------------
+# Feature computation (Adj Close based)
+# -----------------------------------------------------------------------------
+
+
+def add_returns_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    px = out["Adj Close"].astype(float).replace(0.0, np.nan)
+    r1 = px / px.shift(1)
+    r5 = px / px.shift(5)
+    r21 = px / px.shift(21)
+    out["Ret_1d"] = np.log(r1.where(r1 > 0.0))
+    out["Ret_5d"] = np.log(r5.where(r5 > 0.0))
+    out["Ret_21d"] = np.log(r21.where(r21 > 0.0))
+    return out
+
+
+def add_realized_vol_20(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    out["Realized_Vol_20"] = out["Ret_1d"].rolling(20).std()
+    return out
+
+
+def add_daily_target(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Tactical head target (sanity-check): next-day return using Adj Close log-return.
+    """
+    out = df.copy()
+    out["Daily_Return"] = out["Ret_1d"].shift(-1)
+    return out
+
+
+def _semantic_hmm_mapping(mean_by_state: dict[int, float]) -> dict[int, int]:
+    """
+    Map raw 3-state HMM states to semantic regime codes:
+    bull=1 (highest mean return), bear=2 (lowest mean return), high_vol=0 (middle).
+    """
+    states = sorted(mean_by_state.keys(), key=lambda s: mean_by_state[s])
+    low, mid, high = states[0], states[1], states[2]
+    return {high: 1, low: 2, mid: 0}
+
+
+def add_hmm_regime_full_history(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Fit a 3-state Gaussian HMM on the full available history for the ticker.
+    Uses [Ret_1d, Realized_Vol_20] to capture high-vol as a distinct state.
+    """
+    out = df.copy()
+    lr = out["Ret_1d"]
+    rv20 = out["Realized_Vol_20"]
+    mask = lr.notna() & rv20.notna()
+    out["HMM_Regime"] = np.nan
+
+    if int(mask.sum()) < 60:
+        return out
+
+    X_raw = np.column_stack([lr[mask].to_numpy(dtype=float), rv20[mask].to_numpy(dtype=float)])
+    mu = X_raw.mean(axis=0)
+    sigma = X_raw.std(axis=0)
+    sigma = np.where(sigma == 0.0, 1.0, sigma)
+    X = (X_raw - mu) / sigma
+
+    hmm = GaussianHMM(
+        n_components=3,
+        covariance_type="diag",
+        n_iter=300,
+        tol=1e-4,
+        random_state=42,
+        verbose=False,
+    )
+    hmm.fit(X)
+    raw_states = hmm.predict(X)
+    idx = out.index[mask]
+
+    means: dict[int, float] = {}
+    lr_vals = lr[mask].to_numpy(dtype=float)
+    for k in (0, 1, 2):
+        sel = raw_states == k
+        means[k] = float(np.mean(lr_vals[sel])) if np.any(sel) else float("nan")
+
+    mapping = _semantic_hmm_mapping(means)
+    sem = np.asarray([mapping[int(s)] for s in raw_states], dtype=np.int64)
+    out.loc[idx, "HMM_Regime"] = sem
+    out["HMM_Regime"] = out["HMM_Regime"].astype("float")
+    return out
+
+
+def add_rsi_14(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    close = out["Adj Close"].astype(float)
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    alpha = 1.0 / 14.0
+    avg_gain = gain.ewm(alpha=alpha, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=alpha, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.where(avg_loss != 0.0, 100.0)
+    out["RSI_14"] = rsi
+    return out
+
+
+def add_bollinger_distance(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Bollinger distance: standardized distance from 20d moving average in 2-sigma units.
+    """
+    out = df.copy()
+    px = out["Adj Close"].astype(float)
+    ma20 = px.rolling(20).mean()
+    std20 = px.rolling(20).std()
+    denom = (2.0 * std20).replace(0.0, np.nan)
+    out["BB_Dist"] = (px - ma20) / denom
+    return out
+
+
+def add_volume_surge(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    vol = out["Volume"].astype(float)
+    sma20 = vol.rolling(20).mean().replace(0.0, np.nan)
+    out["Volume_Surge"] = vol / sma20
+    return out
+
+
+def add_macro_lagged_returns(df: pd.DataFrame, macro: dict[str, pd.DataFrame]) -> pd.DataFrame:
+    """
+    Merge macro 1d log returns with 1-day lag to avoid leakage.
+    """
+    out = df.copy()
+    out = out.set_index("Date", drop=False)
+
+    for name in MACRO_TICKERS.keys():
+        mdf = macro[name]
+        px = mdf["Adj Close"].astype(float).replace(0.0, np.nan)
+        r1 = px / px.shift(1)
+        mret = np.log(r1.where(r1 > 0.0)).shift(1)  # lag by 1 trading day
+        mret.name = f"Macro_{name}_Ret1d_L1"
+        out = out.join(mret, how="left")
+
+    return out.reset_index(drop=True)
+
+
+def compute_monthly_alpha_adjclose(df: pd.DataFrame, nifty: pd.DataFrame) -> pd.DataFrame:
+    """
+    Monthly_Alpha = ln(P_{t+21}/P_t) - ln(N_{t+21}/N_t), using Adj Close.
+    """
+    out = df.copy()
+    out = out.set_index("Date", drop=False)
+    nifty = nifty.set_index("Date", drop=False)
+
+    p = out["Adj Close"].astype(float).replace(0.0, np.nan)
+    r_fwd = p.shift(-21) / p
+    stock_fwd = np.log(r_fwd.where(r_fwd > 0.0))
+
+    aligned = out.join(nifty[["Adj Close"]].rename(columns={"Adj Close": "NIFTY_AdjClose"}), how="left")
+    n = aligned["NIFTY_AdjClose"].astype(float).replace(0.0, np.nan)
+    n_fwd = n.shift(-21) / n
+    nifty_fwd = np.log(n_fwd.where(n_fwd > 0.0))
+
+    out["Monthly_Alpha"] = stock_fwd - nifty_fwd
+    return out.reset_index(drop=True)
+
+
+def _safe_stem_from_ticker(ticker: str) -> str:
+    return (
+        str(ticker)
+        .replace(".", "_")
+        .replace("^", "_")
+        .replace("=", "_")
+        .replace("/", "_")
+        .replace("&", "_")
+        .replace("-", "_")
+        .strip("_")
+    )
 
 
 def main() -> None:
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    raw_files = list_stock_raw_files(RAW_DIR)
-    if not raw_files:
-        raise FileNotFoundError(f"No stock raw files found in: {RAW_DIR}")
+    stock_paths = list_stock_parquet_files(RAW_DIR)
+    if not stock_paths:
+        raise FileNotFoundError(f"No stock parquet files found in: {RAW_DIR}")
 
-    nifty_path = RAW_DIR / NIFTY_RAW_FILENAME
-    if not nifty_path.exists():
-        raise FileNotFoundError(f"Missing NIFTY benchmark raw file: {nifty_path}")
-    nifty_df = pd.read_csv(nifty_path, parse_dates=["Date"]).sort_values("Date").reset_index(
-        drop=True
-    )
-    nifty_df = nifty_df.set_index("Date", drop=False)
+    _download_benchmark_if_missing()
+    nifty_df = _read_raw_parquet(NIFTY_BENCHMARK_PARQUET)
 
-    macro_data: dict[str, pd.DataFrame] = {}
-    for macro_path in sorted(RAW_DIR.glob("macro_*_raw.csv")):
-        name = macro_path.stem.replace("macro_", "").replace("_raw", "")
-        d = pd.read_csv(macro_path, parse_dates=["Date"]).sort_values("Date").reset_index(
-            drop=True
-        )
-        macro_data[name] = d.set_index("Date", drop=False)
+    macro_data = load_macro_series(RAW_DIR)
 
-    all_dates = pd.concat(
-        [pd.read_csv(RAW_DIR / f, usecols=["Date"], parse_dates=["Date"])["Date"] for f in raw_files]
-        + [nifty_df["Date"]]
-    )
-    start = pd.Timestamp(all_dates.min())
-    end = pd.Timestamp(all_dates.max())
-    print("Downloading index series for cross-asset correlation (NIFTY, S&P 500)...")
-    index_returns = download_index_returns(start, end)
+    for p in stock_paths:
+        df = _read_raw_parquet(p)
+        ticker = str(df["Ticker"].iloc[0]) if "Ticker" in df.columns and len(df) else p.stem
 
-    relative_mom_cols = [
-        "RelMom_5d",
-        "RelMom_21d",
-        "RelMom_63d",
-        "RelMom_126d",
-        "RelMom_252d",
-        "Mom_12_1",
-        "RelMom_12_1",
-    ]
-    macro_cols = []
-    for nm in sorted(macro_data.keys()):
-        macro_cols.extend([f"Macro_{nm}_Ret1d", f"Macro_{nm}_Ret5d"])
-
-    engineered_cols_full = list(ENGINEERED_COLS) + relative_mom_cols + macro_cols
-
-    for fname in raw_files:
-        stem = _output_stem_from_raw_filename(fname)
-        path = RAW_DIR / fname
-        df = pd.read_csv(path, parse_dates=["Date"])
-        df = df.sort_values("Date").reset_index(drop=True)
         n_orig = len(df)
+        out = df.copy()
 
-        enriched = process_ticker(stem, df, index_returns, nifty_df, macro_data)
+        out = add_returns_features(out)
+        out = add_realized_vol_20(out)
+        out = add_rsi_14(out)
+        out = add_bollinger_distance(out)
+        out = add_volume_surge(out)
+        out = add_macro_lagged_returns(out, macro_data)
+        out = compute_monthly_alpha_adjclose(out, nifty_df)
+        out = add_daily_target(out)
+        out = add_hmm_regime_full_history(out)
 
-        enriched = enriched.dropna(how="any")
-        n_after = len(enriched)
-        print(
-            f"\n[{stem}] rows: {n_orig} original → {n_after} after dropna "
-            f"→ {n_orig - n_after} lost"
-        )
+        # Output columns (keep core prices for traceability; features are Adj Close based)
+        keep = [
+            "Date",
+            "Ticker",
+            "Open",
+            "High",
+            "Low",
+            "Close",
+            "Adj Close",
+            "Volume",
+            "Ret_1d",
+            "Ret_5d",
+            "Ret_21d",
+            "Realized_Vol_20",
+            "RSI_14",
+            "BB_Dist",
+            "Volume_Surge",
+        ] + [f"Macro_{k}_Ret1d_L1" for k in MACRO_TICKERS.keys()] + [
+            "Monthly_Alpha",
+            "Daily_Return",
+            "HMM_Regime",
+        ]
 
-        feat_count = len(engineered_cols_full)
-        print(f"[{stem}] engineered feature columns: {feat_count}")
+        out = out[keep]
+        out = out.dropna(how="any")
 
-        enriched = enriched[BASE_COLS + engineered_cols_full + ["Monthly_Alpha", "Beat_NIFTY"]]
-        out_path = PROCESSED_DIR / f"{stem}_features.csv"
-        enriched.to_csv(out_path, index=False)
-        print(f"Saved: {out_path}")
+        if len(out) == 0:
+            print(f"[{ticker}] rows: {n_orig} original → 0 after dropna → [SKIP] empty features")
+            continue
+
+        out_path = PROCESSED_DIR / f"{_safe_stem_from_ticker(ticker)}_features.parquet"
+        out.to_parquet(out_path, index=False)
+
+        print(f"[{ticker}] rows: {n_orig} original → {len(out)} after dropna → saved {out_path.name}")
 
 
 if __name__ == "__main__":

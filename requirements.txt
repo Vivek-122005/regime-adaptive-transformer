@@ -23,3 +23,6 @@ tqdm>=4.66.0
 # Dashboard
 streamlit>=1.28.0
 plotly>=5.17.0
+
+# Parquet IO
+pyarrow>=15.0.0

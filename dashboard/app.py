@@ -1,710 +1,928 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import plotly.graph_objects as go
-import plotly.express as px
-from plotly.subplots import make_subplots
-import os
-import sys
-from pathlib import Path
+"""
+RAMT interactive simulation dashboard — modular Streamlit app with date scrubbing,
+shadow portfolio conviction, regime-shaded equity, and tabbed analytics.
+"""
 
-# Add project root to path
-ROOT = Path(__file__).parent.parent
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import joblib
+import numpy as np
+import pandas as pd
+import plotly.graph_objects as go
+import streamlit as st
+import torch
+import yfinance as yf
+from plotly.subplots import make_subplots
+
+# Project root
+ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
-# ─── Page Config ────────────────────────────────────────────
-st.set_page_config(
-    page_title="RAMT Trading Dashboard",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
+from models.ramt.dataset import (
+    ALL_FEATURE_COLS,
+    MACRO_COLS,
+    PRICE_COLS,
+    TECH_COLS,
+    TICKER_TO_ID,
+    VOLUME_COLS,
 )
+from models.ramt.model import build_ramt
 
-# ─── Custom CSS ─────────────────────────────────────────────
-st.markdown("""
-<style>
-    .main { background-color: #0f172a; }
-    .stApp { background-color: #0f172a; }
-    
-    .metric-card {
-        background: #1e293b;
-        border: 1px solid #334155;
-        border-radius: 12px;
-        padding: 20px;
-        text-align: center;
-    }
-    
-    .bull-badge {
-        background: #166534;
-        color: #bbf7d0;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
-        font-size: 14px;
-    }
-    
-    .bear-badge {
-        background: #7f1d1d;
-        color: #fecaca;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
-        font-size: 14px;
-    }
-    
-    .highvol-badge {
-        background: #7c2d12;
-        color: #fed7aa;
-        padding: 4px 12px;
-        border-radius: 20px;
-        font-weight: bold;
-        font-size: 14px;
-    }
-    
-    .buy-signal {
-        background: #14532d;
-        border: 1px solid #16a34a;
-        border-radius: 8px;
-        padding: 12px;
-        color: #86efac;
-        font-size: 18px;
-        font-weight: bold;
-        text-align: center;
-    }
-    
-    .sell-signal {
-        background: #450a0a;
-        border: 1px solid #dc2626;
-        border-radius: 8px;
-        padding: 12px;
-        color: #fca5a5;
-        font-size: 18px;
-        font-weight: bold;
-        text-align: center;
-    }
-    
-    .hold-signal {
-        background: #1c1917;
-        border: 1px solid #78716c;
-        border-radius: 8px;
-        padding: 12px;
-        color: #d6d3d1;
-        font-size: 18px;
-        font-weight: bold;
-        text-align: center;
-    }
-    
-    div[data-testid="stMetricValue"] {
-        font-size: 28px;
-        font-weight: bold;
-        color: #f1f5f9;
-    }
-    
-    div[data-testid="stMetricLabel"] {
-        color: #94a3b8;
-        font-size: 12px;
-    }
-</style>
-""", unsafe_allow_html=True)
+try:
+    from models.ramt.dataset import build_ticker_universe
+except Exception:  # pragma: no cover
+    build_ticker_universe = None  # type: ignore[misc, assignment]
 
-# ─── Portfolio View ───────────────────────────────────────────
+# ─── Calendar bounds (user requirement) ─────────────────────
+WINDOW_MIN = pd.Timestamp("2023-01-01")
+WINDOW_MAX = pd.Timestamp("2026-12-31")
 
+REGIME_COLORS = {0: "#eab308", 1: "#22c55e", 2: "#ef4444"}
+REGIME_NAMES = {0: "HIGH VOL", 1: "BULL", 2: "BEAR"}
 
-def show_portfolio_signals(regime_info, rankings: pd.DataFrame):
-    """
-    Main dashboard view:
+# Light tints for chart backgrounds (High-Vol = yellow, Bull = green, Bear = red)
+REGIME_VRECT_FILL = {
+    0: "rgba(250, 204, 21, 0.22)",   # light yellow — high vol
+    1: "rgba(34, 197, 94, 0.14)",   # light green — bull
+    2: "rgba(248, 113, 113, 0.18)", # light red — bear
+}
 
-    CURRENT REGIME: BULL
-    POSITION SIZE: 100%
-
-    THIS MONTH BUY LIST:
-    1. TCS      score: 0.87  momentum: +24%
-    2. INFY     score: 0.82  momentum: +19%
-    3. HCLTECH  score: 0.75  momentum: +16%
-    4. WIPRO    score: 0.71  momentum: +14%
-    5. TECHM    score: 0.68  momentum: +12%
-
-    AVOID (negative score):
-    TATASTEEL  score: -0.45
-    ONGC       score: -0.32
-    """
-    st.markdown("### 📌 Monthly Portfolio Signals")
-
-    if not regime_info:
-        st.warning("Regime info not available. Run feature engineering first.")
-        return
-
-    regime_name = regime_info["name"]
-    if regime_info["current"] == 2:
-        position_size = 0.0
-        top_n = 0
-    elif regime_info["current"] == 0:
-        position_size = 0.5
-        top_n = 3
-    else:
-        position_size = 1.0
-        top_n = 5
-
-    col_a, col_b = st.columns(2)
-    with col_a:
-        st.metric("Current Regime", regime_name)
-    with col_b:
-        st.metric("Position Size", f"{position_size*100:.0f}%")
-
-    if position_size == 0.0:
-        st.info("BEAR regime → stay in cash this month.")
-        return
-
-    if rankings is None or rankings.empty:
-        st.info(
-            "No monthly rankings found yet. Once `results/monthly_rankings.csv` exists, "
-            "this view will show the top stocks for the current month."
-        )
-        return
-
-    expected_cols = {"Date", "Ticker", "score", "momentum"}
-    if not expected_cols.issubset(set(rankings.columns)):
-        st.warning(
-            f"Rankings file is missing expected columns: {sorted(expected_cols)}. "
-            f"Found: {sorted(rankings.columns)}"
-        )
-        return
-
-    rankings = rankings.copy()
-    rankings["Date"] = pd.to_datetime(rankings["Date"])
-    current_month = rankings["Date"].max()
-    month_df = rankings[rankings["Date"] == current_month].sort_values("score", ascending=False)
-
-    st.markdown(f"#### This month buy list ({current_month.date()})")
-    buy_df = month_df.head(top_n).copy()
-    buy_df["momentum"] = (buy_df["momentum"] * 100).round(2)
-    st.dataframe(
-        buy_df[["Ticker", "score", "momentum"]].rename(columns={"momentum": "momentum_%"}),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    avoid_df = month_df[month_df["score"] < 0].head(10).copy()
-    if not avoid_df.empty:
-        st.markdown("#### Avoid (negative score)")
-        st.dataframe(
-            avoid_df[["Ticker", "score"]],
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-# ─── Constants ───────────────────────────────────────────────
-TICKERS = {
+TICKERS_FALLBACK = {
     "TCS": "TCS_NS",
-    "RELIANCE": "RELIANCE_NS", 
+    "RELIANCE": "RELIANCE_NS",
     "HDFC Bank": "HDFCBANK_NS",
     "EPIGRAL": "EPIGRAL_NS",
-    "JPM (US)": "JPM"
+    "JPM (US)": "JPM",
 }
 
-REGIME_COLORS = {
-    0: "#f97316",  # orange - high vol
-    1: "#22c55e",  # green - bull
-    2: "#ef4444"   # red - bear
-}
 
-REGIME_NAMES = {
-    0: "HIGH VOL",
-    1: "BULL",
-    2: "BEAR"
-}
+# ─── Page & theme ────────────────────────────────────────────
+def _inject_theme_css() -> None:
+    mono = "'JetBrains Mono', 'SF Mono', ui-monospace, monospace"
+    st.markdown(
+        f"""
+<style>
+    html, body, [class*="css"] {{
+        font-family: {mono};
+    }}
+    .stApp, .main, header[data-testid="stHeader"] {{
+        background-color: #0b1020 !important;
+    }}
+    .block-container {{
+        padding-top: 1.2rem;
+        max-width: 1400px;
+    }}
+    div[data-testid="stSidebar"] {{
+        background: linear-gradient(180deg, #0f172a 0%, #0b1020 100%);
+        border-right: 1px solid #1e293b;
+    }}
+    div[data-testid="stMetricValue"] {{
+        font-size: 26px;
+        font-weight: 600;
+        color: #e2e8f0;
+        font-family: {mono};
+    }}
+    div[data-testid="stMetricLabel"] {{
+        color: #94a3b8;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+    }}
+    .shadow-badge-bear {{
+        display: inline-block;
+        background: #450a0a;
+        color: #fecaca;
+        border: 1px solid #7f1d1d;
+        border-radius: 6px;
+        padding: 8px 14px;
+        font-weight: 700;
+        font-size: 13px;
+        letter-spacing: 0.06em;
+        margin-bottom: 12px;
+    }}
+    h1, h2, h3 {{
+        font-weight: 600;
+        letter-spacing: -0.02em;
+    }}
+    [data-testid="stTabs"] [aria-selected="true"] {{
+        color: #38bdf8 !important;
+    }}
+</style>
+""",
+        unsafe_allow_html=True,
+    )
 
-# ─── Data Loaders ────────────────────────────────────────────
-@st.cache_data(ttl=300)
-def load_features(ticker_code):
-    """Load processed features CSV for a ticker."""
-    path = ROOT / f"data/processed/{ticker_code}_features.csv"
+
+st.set_page_config(
+    page_title="RAMT · Simulation Workbench",
+    page_icon="◈",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+_inject_theme_css()
+
+
+# ─── Data layer ──────────────────────────────────────────────
+def _ranking_csv_mtime(path: Path) -> float:
+    return float(path.stat().st_mtime) if path.is_file() else 0.0
+
+
+@st.cache_data(show_spinner=False)
+def _read_ranking_predictions_cached(csv_path: str, mtime: float) -> pd.DataFrame | None:
+    """Single read of ranking CSV; cache invalidates when mtime changes."""
+    p = Path(csv_path)
+    if not p.is_file():
+        return None
+    df = pd.read_csv(p, parse_dates=["Date"])
+    return df
+
+
+@st.cache_data(show_spinner=False)
+def _ensure_nifty_features_cached(processed_s: str, raw_s: str) -> str | None:
+    """Build or resolve NIFTY features Parquet (HMM regime)."""
+    try:
+        from models.backtest import ensure_nifty_features_parquet
+
+        return ensure_nifty_features_parquet(processed_s, raw_s)
+    except Exception:
+        out = Path(processed_s) / "_NSEI_features.parquet"
+        return str(out) if out.is_file() else None
+
+
+@st.cache_data(show_spinner=False)
+def _load_nifty_regime_series_cached(features_parquet: str | None) -> pd.Series | None:
+    if not features_parquet:
+        return None
+    p = Path(features_parquet)
+    if not p.is_file():
+        return None
+    df = pd.read_parquet(p, columns=["Date", "HMM_Regime"])
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.set_index("Date")["HMM_Regime"].astype(float).sort_index().ffill()
+
+
+@st.cache_data(show_spinner=False)
+def _load_nifty_adj_close_cached(raw_dir_s: str) -> pd.Series | None:
+    try:
+        from models.backtest import _load_nifty_benchmark_raw
+    except Exception:
+        return None
+    try:
+        raw = _load_nifty_benchmark_raw(Path(raw_dir_s))
+    except Exception:
+        return None
+    raw["Date"] = pd.to_datetime(raw["Date"])
+    return raw.set_index("Date")["Adj Close"].astype(float).sort_index()
+
+
+@st.cache_data(show_spinner=False)
+def discover_ticker_stems() -> list[str]:
+    if build_ticker_universe is not None:
+        try:
+            u = build_ticker_universe(str(ROOT / "data" / "processed"))
+            if u:
+                return sorted(u)
+        except Exception:
+            pass
+    processed = ROOT / "data" / "processed"
+    if not processed.is_dir():
+        return sorted(TICKERS_FALLBACK.values())
+    out: list[str] = []
+    for p in sorted(processed.glob("*_features.parquet")):
+        stem = p.stem[: -len("_features")] if p.stem.endswith("_features") else p.stem
+        if stem.lstrip("_").upper() in ("NSEI", "NIFTY50"):
+            continue
+        if stem.startswith("macro_"):
+            continue
+        out.append(stem)
+    return sorted(set(out)) if out else sorted(TICKERS_FALLBACK.values())
+
+
+@st.cache_data(show_spinner=False)
+def load_features(ticker_code: str) -> pd.DataFrame | None:
+    pq = ROOT / f"data/processed/{ticker_code}_features.parquet"
+    csv = ROOT / f"data/processed/{ticker_code}_features.csv"
+    path = pq if pq.exists() else csv
     if not path.exists():
         return None
-    # Your processed CSVs have a Date column; make it the index for plotting.
-    df = pd.read_csv(path, parse_dates=["Date"])
+    if path.suffix == ".parquet":
+        df = pd.read_parquet(path)
+        df["Date"] = pd.to_datetime(df["Date"])
+    else:
+        df = pd.read_csv(path, parse_dates=["Date"])
     if "Date" in df.columns:
         df = df.sort_values("Date").set_index("Date")
     return df
 
-@st.cache_data(ttl=300)
-def load_predictions(model_name):
-    """Load prediction CSV for a model."""
-    path = ROOT / f"results/{model_name}_predictions.csv"
+
+@st.cache_data(show_spinner=False)
+def load_predictions(model_name: str) -> pd.DataFrame | None:
+    m = (model_name or "").lower()
+    if m == "ramt":
+        path = ROOT / "results/ramt_predictions.csv"
+        if not path.exists():
+            path = ROOT / "results/ranking_predictions.csv"
+    else:
+        path = ROOT / f"results/{m}_predictions.csv"
     if not path.exists():
         return None
-    df = pd.read_csv(path, parse_dates=['Date'])
+    df = pd.read_csv(path, parse_dates=["Date"])
+    if "predicted_alpha" in df.columns and "actual_alpha" in df.columns:
+        df = df.rename(columns={"predicted_alpha": "y_pred", "actual_alpha": "y_true"})
     return df
 
-@st.cache_data(ttl=300)
-def load_all_predictions():
-    """Load all available prediction files."""
-    models = {}
-    for name in ['xgboost', 'lstm', 'ramt']:
+
+@st.cache_data(show_spinner=False)
+def load_all_predictions() -> dict[str, pd.DataFrame]:
+    models: dict[str, pd.DataFrame] = {}
+    for name in ["xgboost", "lstm", "ramt"]:
         df = load_predictions(name)
-        if df is not None:
+        if df is not None and {"y_true", "y_pred"}.issubset(df.columns):
             models[name.upper()] = df
     return models
 
 
-@st.cache_data(ttl=300)
-def load_ranking_predictions():
-    """Walk-forward / fixed-train RAMT outputs (rebalance dates)."""
-    path = ROOT / "results/ranking_predictions.csv"
-    if not path.exists():
-        return None
-    return pd.read_csv(path, parse_dates=["Date"])
-
-
-@st.cache_data(ttl=300)
-def load_monthly_rankings():
+@st.cache_data(show_spinner=False)
+def load_monthly_rankings() -> pd.DataFrame | None:
     path = ROOT / "results/monthly_rankings.csv"
     if not path.exists():
         return None
     return pd.read_csv(path)
 
 
-@st.cache_data(ttl=300)
-def load_backtest_results():
+@st.cache_data(show_spinner=False)
+def load_backtest_results() -> pd.DataFrame | None:
     path = ROOT / "results/backtest_results.csv"
     if not path.exists():
         return None
     df = pd.read_csv(path, parse_dates=["date"])
     return df.sort_values("date")
 
-def compute_metrics(y_true, y_pred):
-    """Compute trading metrics from predictions."""
+
+@st.cache_data(show_spinner=False)
+def load_data(root_s: str) -> dict[str, Any]:
+    """
+    Central loader: ensures NIFTY features exist, exposes paths and raw frames for the session.
+    Cached so scrubbing the UI does not re-hit disk beyond inner cached readers.
+    """
+    root = Path(root_s)
+    processed = root / "data" / "processed"
+    raw = root / "data" / "raw"
+    nifty_parquet = _ensure_nifty_features_cached(str(processed), str(raw))
+    regime_series = _load_nifty_regime_series_cached(nifty_parquet)
+    nifty_prices = _load_nifty_adj_close_cached(str(raw))
+
+    rpath = root / "results" / "ranking_predictions.csv"
+    mtime = _ranking_csv_mtime(rpath)
+    ranking_df = _read_ranking_predictions_cached(str(rpath), mtime)
+
+    return {
+        "root": root,
+        "nifty_features_path": nifty_parquet,
+        "regime_series": regime_series,
+        "nifty_prices": nifty_prices,
+        "ranking_predictions_path": rpath,
+        "ranking_mtime": mtime,
+        "ranking_df": ranking_df,
+        "monthly_rankings": load_monthly_rankings(),
+        "backtest_results": load_backtest_results(),
+    }
+
+
+# ─── Filters & simulation ────────────────────────────────────
+def filter_ranking_by_dates(
+    df: pd.DataFrame | None,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    test_only: bool,
+) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+    end_inc = end.normalize() + pd.Timedelta(days=1)
+    out = out[(out["Date"] >= start.normalize()) & (out["Date"] < end_inc)]
+    if test_only and "Period" in out.columns:
+        out = out[out["Period"].astype(str).str.strip() == "Test"]
+    return out
+
+
+def simulate_portfolio(
+    full: pd.DataFrame,
+    start: pd.Timestamp,
+    end: pd.Timestamp,
+    top_n: int,
+    initial_capital: float,
+    test_only: bool,
+    nifty_prices: pd.Series | None,
+) -> dict[str, Any] | None:
+    need = {"Date", "Ticker", "predicted_alpha", "actual_alpha"}
+    if not need.issubset(full.columns):
+        return None
+    df = filter_ranking_by_dates(full, start, end, test_only)
+    if df.empty:
+        return {
+            "rebalance_dates": [],
+            "strategy_equity": np.array([]),
+            "nifty_equity": np.array([]),
+            "period_returns": np.array([]),
+            "rows_detail": pd.DataFrame(),
+        }
+
+    reb_dates = sorted(df["Date"].unique())
+    period_excess: list[float] = []
+    rows_detail: list[dict[str, Any]] = []
+    for d in reb_dates:
+        block = df[df["Date"] == d].nlargest(top_n, "predicted_alpha")
+        if block.empty:
+            continue
+        m_excess = float(block["actual_alpha"].mean())
+        period_excess.append(m_excess)
+        tickers = block["Ticker"].astype(str).tolist()
+        rows_detail.append(
+            {
+                "Date": d,
+                "top_tickers": ", ".join(tickers),
+                "tickers_list": tickers,
+                "mean_actual_alpha": m_excess,
+                "n_names": len(block),
+            }
+        )
+
+    if not period_excess:
+        return {
+            "rebalance_dates": [],
+            "strategy_equity": np.array([]),
+            "nifty_equity": np.array([]),
+            "period_returns": np.array([]),
+            "rows_detail": pd.DataFrame(),
+        }
+
+    period_excess = np.asarray(period_excess, dtype=np.float64)
+    strat_eq = float(initial_capital) * np.cumprod(1.0 + period_excess)
+
+    nifty_eq = np.full(len(reb_dates), np.nan, dtype=np.float64)
+    if nifty_prices is not None and len(reb_dates) > 0:
+        p0 = float(nifty_prices.asof(reb_dates[0]))
+        if p0 > 0 and np.isfinite(p0):
+            for i, d in enumerate(reb_dates):
+                pi = float(nifty_prices.asof(pd.Timestamp(d)))
+                nifty_eq[i] = float(initial_capital) * (pi / p0)
+
+    return {
+        "rebalance_dates": reb_dates,
+        "strategy_equity": strat_eq,
+        "nifty_equity": nifty_eq,
+        "period_returns": period_excess,
+        "rows_detail": pd.DataFrame(rows_detail),
+    }
+
+
+def regime_at(reg: pd.Series | None, ts: pd.Timestamp) -> int | None:
+    if reg is None:
+        return None
+    v = reg.asof(ts)
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    return int(max(0, min(2, int(float(v)))))
+
+
+def top5_shadow_for_date(df: pd.DataFrame, as_of: pd.Timestamp) -> pd.DataFrame:
+    """Top 5 by predicted_alpha on the given rebalance date (nearest prior date if missing)."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    d["Date"] = pd.to_datetime(d["Date"])
+    ts = pd.Timestamp(as_of).normalize()
+    exact = d[d["Date"].dt.normalize() == ts]
+    if exact.empty:
+        prior = d[d["Date"].dt.normalize() <= ts]
+        if prior.empty:
+            return pd.DataFrame()
+        last_d = prior["Date"].max()
+        exact = d[d["Date"] == last_d]
+    return exact.nlargest(5, "predicted_alpha")[
+        ["Ticker", "predicted_alpha", "actual_alpha"]
+    ].reset_index(drop=True)
+
+
+# ─── Metrics ─────────────────────────────────────────────────
+def directional_accuracy_rows(df: pd.DataFrame) -> float:
+    if df is None or df.empty or len(df) < 1:
+        return 0.0
+    a = df["actual_alpha"].to_numpy(dtype=float)
+    p = df["predicted_alpha"].to_numpy(dtype=float)
+    return float(np.mean(np.sign(a) == np.sign(p)) * 100.0)
+
+
+def sharpe_from_period_returns(period: np.ndarray) -> float:
+    if period is None or len(period) < 2:
+        return 0.0
+    m = float(np.mean(period))
+    s = float(np.std(period, ddof=0))
+    if s < 1e-12:
+        return 0.0
+    # Monthly rebalance cadence → √12 annualization
+    return m / s * np.sqrt(12.0)
+
+
+def max_drawdown_from_equity(equity: np.ndarray) -> float:
+    if equity is None or len(equity) < 1:
+        return 0.0
+    eq = np.asarray(equity, dtype=float)
+    peak = np.maximum.accumulate(eq)
+    dd = (eq - peak) / (peak + 1e-12)
+    return float(dd.min())
+
+
+def calculate_metrics(
+    ranking_slice: pd.DataFrame,
+    sim: dict[str, Any] | None,
+) -> dict[str, float]:
+    """Directional accuracy from all ranking rows; Sharpe & MDD from simulated equity."""
+    da = directional_accuracy_rows(ranking_slice)
+    pr = sim.get("period_returns") if sim else None
+    eq = sim.get("strategy_equity") if sim else None
+    if pr is None or len(pr) == 0:
+        sharpe = 0.0
+        mdd = 0.0
+    else:
+        sharpe = sharpe_from_period_returns(np.asarray(pr))
+        mdd = max_drawdown_from_equity(np.asarray(eq)) if eq is not None and len(eq) else 0.0
+    return {"DA%": da, "Sharpe": sharpe, "MaxDD": mdd}
+
+
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+) -> dict[str, float]:
+    """Legacy daily-style metrics for model comparison tables."""
     if len(y_true) == 0:
         return {}
-    
-    rmse = float(np.sqrt(np.mean((y_true - y_pred)**2)))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred) ** 2)))
     mae = float(np.mean(np.abs(y_true - y_pred)))
     da = float(np.mean(np.sign(y_true) == np.sign(y_pred)) * 100)
-    
     rolling_std = pd.Series(y_pred).rolling(20).std()
     rolling_std = rolling_std.fillna(float(np.std(y_pred)))
     position = np.clip(y_pred / (rolling_std.values + 1e-8), -2, 2)
     strategy_ret = y_true * position
-    
-    sharpe = float(
-        np.mean(strategy_ret) / 
-        (np.std(strategy_ret) + 1e-8) * np.sqrt(252)
-    )
-    
+    sharpe = float(np.mean(strategy_ret) / (np.std(strategy_ret) + 1e-8) * np.sqrt(252))
     cumulative = np.cumprod(1 + strategy_ret)
     rolling_max = np.maximum.accumulate(cumulative)
     drawdown = (cumulative - rolling_max) / (rolling_max + 1e-8)
     max_dd = float(drawdown.min())
-    
     return {
-        'RMSE': round(rmse, 4),
-        'MAE': round(mae, 4),
-        'DA%': round(da, 2),
-        'Sharpe': round(sharpe, 2),
-        'MaxDD': round(max_dd, 4)
+        "RMSE": round(rmse, 4),
+        "MAE": round(mae, 4),
+        "DA%": round(da, 2),
+        "Sharpe": round(sharpe, 2),
+        "MaxDD": round(max_dd, 4),
     }
 
-def get_current_regime(df):
-    """Get current regime info from features DataFrame."""
-    if df is None or 'HMM_Regime' not in df.columns:
-        return None
-    
-    last_regime = int(df['HMM_Regime'].iloc[-1])
-    
-    # Count days in current regime
-    regimes = df['HMM_Regime'].values
-    days_in_regime = 1
-    for i in range(len(regimes)-2, -1, -1):
-        if int(regimes[i]) == last_regime:
-            days_in_regime += 1
+
+# ─── Sidebar ─────────────────────────────────────────────────
+@dataclass
+class SidebarState:
+    ticker_code: str
+    selected_model: str
+    date_start: pd.Timestamp
+    date_end: pd.Timestamp
+    as_of_date: pd.Timestamp
+    live_test_only: bool
+    sim_top_n: int
+    sim_capital: float
+    chart_days: int
+
+
+def _clamp_window(
+    dmin: pd.Timestamp | None,
+    dmax: pd.Timestamp | None,
+) -> tuple[pd.Timestamp, pd.Timestamp]:
+    """Intersection of dataset dates with [2023-01-01, 2026-12-31]."""
+    lo, hi = WINDOW_MIN, WINDOW_MAX
+    if dmin is not None:
+        lo = max(lo, pd.Timestamp(dmin))
+    if dmax is not None:
+        hi = min(hi, pd.Timestamp(dmax))
+    if lo > hi:
+        # No overlap between file dates and 2023–2026 — keep calendar bounds for UI
+        return WINDOW_MIN, WINDOW_MAX
+    return lo, hi
+
+
+def render_sidebar(
+    ranking_df: pd.DataFrame | None,
+) -> SidebarState:
+    stems = discover_ticker_stems()
+    dmin = dmax = None
+    if ranking_df is not None and not ranking_df.empty:
+        ranking_df = ranking_df.copy()
+        ranking_df["Date"] = pd.to_datetime(ranking_df["Date"])
+        dmin = ranking_df["Date"].min()
+        dmax = ranking_df["Date"].max()
+
+    w_lo, w_hi = _clamp_window(dmin, dmax)
+
+    with st.sidebar:
+        st.markdown("## ◈ RAMT Workbench")
+        st.caption("Regime-adaptive simulation · NIFTY200")
+        st.markdown("---")
+
+        ticker_code = st.selectbox(
+            "Ticker (processed stem)",
+            stems,
+            index=0,
+            help="Matches `data/processed/{stem}_features.parquet`.",
+        )
+
+        available_models: list[str] = []
+        for name in ["xgboost", "lstm", "ramt"]:
+            df = load_predictions(name)
+            if df is not None and {"y_true", "y_pred"}.issubset(df.columns):
+                available_models.append(name.upper())
+
+        if available_models:
+            selected_model = st.selectbox("Primary model", available_models, index=0)
         else:
-            break
-    
-    # Compute regime distribution last 60 days
-    recent = df['HMM_Regime'].tail(60)
-    total = len(recent)
-    bull_pct = float((recent == 1).sum() / total * 100)
-    bear_pct = float((recent == 2).sum() / total * 100)
-    hv_pct = float((recent == 0).sum() / total * 100)
-    
-    return {
-        'current': last_regime,
-        'name': REGIME_NAMES[last_regime],
-        'color': REGIME_COLORS[last_regime],
-        'days': days_in_regime,
-        'bull_pct': bull_pct,
-        'bear_pct': bear_pct,
-        'hv_pct': hv_pct
-    }
+            selected_model = "XGBOOST"
+            st.warning("No `results/*_predictions.csv` found.")
 
-def get_latest_signal(predictions_df, ticker_code):
-    """Get the most recent prediction signal for a ticker."""
-    if predictions_df is None:
-        return None
-    
-    ticker_preds = predictions_df[
-        predictions_df['Ticker'] == ticker_code
-    ].copy()
-    
-    if ticker_preds.empty:
-        return None
-    
-    ticker_preds = ticker_preds.sort_values('Date')
-    last_row = ticker_preds.iloc[-1]
-    
-    pred = float(last_row['y_pred'])
-    actual = float(last_row['y_true'])
-    
-    if pred > 0.003:
-        signal = "BUY"
-        signal_class = "buy-signal"
-    elif pred < -0.003:
-        signal = "SELL / AVOID"
-        signal_class = "sell-signal"
-    else:
-        signal = "HOLD / WEAK"
-        signal_class = "hold-signal"
-    
-    return {
-        'prediction': pred,
-        'prediction_pct': round(pred * 100, 3),
-        'signal': signal,
-        'signal_class': signal_class,
-        'last_date': str(last_row['Date'])[:10]
-    }
+        st.markdown("---")
+        st.markdown("### Date window (2023–2026)")
+
+        if dmin is None:
+            st.caption("Add `results/ranking_predictions.csv` to enable scrubbing.")
+            ds, de = w_lo.date(), w_hi.date()
+            live_test_only = True
+        else:
+            live_test_only = st.checkbox(
+                "Blind test rows only (`Period == Test`)",
+                value=True,
+                help="Uncheck to include train-era rows in the window.",
+            )
+            ds, de = st.date_input(
+                "Range",
+                value=(w_lo.date(), w_hi.date()),
+                min_value=w_lo.date(),
+                max_value=w_hi.date(),
+                help="Metrics and equity use this inclusive window.",
+            )
+
+        if isinstance(ds, tuple):
+            start_d, end_d = ds[0], ds[1]
+        else:
+            start_d = end_d = ds
+
+        date_start = pd.Timestamp(start_d)
+        date_end = pd.Timestamp(end_d)
+        if date_start > date_end:
+            date_start, date_end = date_end, date_start
+
+        # As-of date for shadow picks: rebalance dates inside window
+        if ranking_df is not None and not ranking_df.empty:
+            udates = sorted(
+                {pd.Timestamp(d).normalize() for d in pd.to_datetime(ranking_df["Date"])}
+            )
+            udates = [d for d in udates if date_start <= d <= date_end]
+            if not udates:
+                udates = sorted(
+                    {pd.Timestamp(d).normalize() for d in pd.to_datetime(ranking_df["Date"])}
+                )
+            default_asof = udates[-1] if udates else date_end
+            as_of = st.select_slider(
+                "As-of date (shadow picks)",
+                options=udates,
+                value=default_asof,
+                format_func=lambda x: pd.Timestamp(x).strftime("%Y-%m-%d"),
+                help="Top-5 conviction uses this rebalance date.",
+            )
+            as_of_date = pd.Timestamp(as_of)
+        else:
+            as_of_date = date_end
+            st.caption("As-of defaults to window end when predictions load.")
+
+        st.markdown("---")
+        st.markdown("### Simulation")
+        sim_top_n = st.slider("Top-N per rebalance", 3, 10, 5)
+        sim_capital = float(
+            st.number_input("Starting capital (₹)", value=100_000.0, step=10_000.0)
+        )
+
+        st.markdown("---")
+        chart_days = st.slider("Chart history (days)", 30, 365, 120, step=30)
+
+        st.markdown("---")
+        if st.button("Refresh cache", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
+    return SidebarState(
+        ticker_code=ticker_code,
+        selected_model=selected_model,
+        date_start=date_start,
+        date_end=date_end,
+        as_of_date=as_of_date,
+        live_test_only=live_test_only,
+        sim_top_n=sim_top_n,
+        sim_capital=sim_capital,
+        chart_days=chart_days,
+    )
+
 
 # ─── Charts ──────────────────────────────────────────────────
+def render_charts(
+    sim: dict[str, Any] | None,
+    regime_series: pd.Series | None,
+) -> None:
+    fig = build_live_equity_figure(sim, regime_series)
+    if fig is None:
+        st.info("No rebalances in this window — widen the date range or disable test-only.")
+        return
+    st.plotly_chart(fig, use_container_width=True)
 
-def plot_actual_vs_predicted(predictions_df, ticker_code, 
-                              days=120):
-    """Plot actual vs predicted returns."""
-    if predictions_df is None:
+
+def build_live_equity_figure(
+    sim: dict[str, Any] | None,
+    regime_series: pd.Series | None,
+) -> go.Figure | None:
+    if not sim:
         return None
-    
-    df = predictions_df[
-        predictions_df['Ticker'] == ticker_code
-    ].copy().sort_values('Date').tail(days)
-    
-    if df.empty:
+    dates = sim.get("rebalance_dates") or []
+    strat = sim.get("strategy_equity")
+    if not dates or strat is None or len(strat) == 0:
         return None
-    
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=(
-            f'Daily Returns — Actual vs Predicted ({days} days)',
-            'Prediction Accuracy (Correct Direction = Green)'
-        ),
-        vertical_spacing=0.12,
-        row_heights=[0.6, 0.4]
-    )
-    
-    # Chart 1 — Actual returns bars
-    fig.add_trace(
-        go.Bar(
-            x=df['Date'],
-            y=df['y_true'] * 100,
-            name='Actual Return %',
-            marker_color=[
-                '#22c55e' if v > 0 else '#ef4444' 
-                for v in df['y_true']
-            ],
-            opacity=0.7
-        ),
-        row=1, col=1
-    )
-    
-    # Predicted line
+    nifty = sim.get("nifty_equity")
+    detail = sim.get("rows_detail")
+    if detail is not None and not detail.empty and "tickers_list" in detail.columns:
+        hover_holdings = [" · ".join(t) for t in detail["tickers_list"]]
+    elif detail is not None and not detail.empty and "top_tickers" in detail.columns:
+        hover_holdings = detail["top_tickers"].tolist()
+    else:
+        hover_holdings = [""] * len(dates)
+
+    fig = go.Figure()
+
+    if regime_series is not None and len(dates) >= 2:
+        for i in range(len(dates) - 1):
+            ts = pd.Timestamp(dates[i])
+            ri = regime_at(regime_series, ts)
+            if ri is None:
+                ri = 1
+            fig.add_vrect(
+                x0=dates[i],
+                x1=dates[i + 1],
+                fillcolor=REGIME_VRECT_FILL.get(ri, REGIME_VRECT_FILL[1]),
+                line_width=0,
+                layer="below",
+            )
+
     fig.add_trace(
         go.Scatter(
-            x=df['Date'],
-            y=df['y_pred'] * 100,
-            name='Predicted Return %',
-            line=dict(color='#f97316', width=2),
-            mode='lines'
-        ),
-        row=1, col=1
+            x=dates,
+            y=strat,
+            mode="lines+markers",
+            name="RAMT top-N (compounded α)",
+            line=dict(color="#4ade80", width=2.5),
+            marker=dict(size=7),
+            customdata=np.array([[h] for h in hover_holdings], dtype=object),
+            hovertemplate=(
+                "<b>%{x|%Y-%m-%d}</b><br>"
+                "Equity: %{y:,.0f} ₹<br>"
+                "<b>Holdings (top-N)</b><br>%{customdata[0]}<extra></extra>"
+            ),
+        )
     )
-    
-    # Zero line
-    fig.add_hline(
-        y=0, line_dash="dash", 
-        line_color="#475569", 
-        line_width=1,
-        row=1, col=1
-    )
-    
-    # Chart 2 — Direction accuracy
-    correct = (
-        np.sign(df['y_true'].values) == 
-        np.sign(df['y_pred'].values)
-    ).astype(int)
-    
-    fig.add_trace(
-        go.Bar(
-            x=df['Date'],
-            y=correct,
-            name='Direction Correct',
-            marker_color=[
-                '#22c55e' if c == 1 else '#ef4444' 
-                for c in correct
-            ],
-            showlegend=False
-        ),
-        row=2, col=1
-    )
-    
+    if nifty is not None and len(nifty) == len(dates) and np.any(np.isfinite(nifty)):
+        fig.add_trace(
+            go.Scatter(
+                x=dates,
+                y=nifty,
+                mode="lines+markers",
+                name="NIFTY buy & hold",
+                line=dict(color="#38bdf8", width=2, dash="dash"),
+                marker=dict(size=5),
+                hovertemplate="%{x|%Y-%m-%d}<br>NIFTY notional: %{y:,.0f} ₹<extra></extra>",
+            )
+        )
+
     fig.update_layout(
-        paper_bgcolor='#0f172a',
-        plot_bgcolor='#1e293b',
-        font=dict(color='#f1f5f9', size=12),
-        legend=dict(
-            bgcolor='#1e293b',
-            bordercolor='#334155'
-        ),
-        height=500,
-        margin=dict(t=50, b=20)
+        title="Equity curve — HMM regime shading (yellow=high vol, green=bull, red=bear)",
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0", family="'JetBrains Mono', monospace", size=12),
+        height=480,
+        margin=dict(t=48, b=52, l=12, r=12),
+        yaxis_title="Notional (₹)",
+        xaxis_title="Rebalance date",
+        legend=dict(bgcolor="#1e293b", bordercolor="#334155", borderwidth=1),
+        hovermode="x unified",
     )
-    
-    fig.update_xaxes(
-        gridcolor='#334155', 
-        showgrid=True
-    )
-    fig.update_yaxes(
-        gridcolor='#334155', 
-        showgrid=True
-    )
-    
+    fig.update_xaxes(gridcolor="#1e293b", rangeslider=dict(visible=True, thickness=0.06))
+    fig.update_yaxes(gridcolor="#1e293b")
     return fig
 
 
-def plot_cumulative_returns(predictions_df, ticker_code):
-    """Plot strategy vs buy-and-hold cumulative returns."""
+def plot_actual_vs_predicted(predictions_df: pd.DataFrame | None, ticker_code: str, days: int = 120):
     if predictions_df is None:
         return None
-    
-    df = predictions_df[
-        predictions_df['Ticker'] == ticker_code
-    ].copy().sort_values('Date')
-    
+    df = predictions_df[predictions_df["Ticker"] == ticker_code].copy().sort_values("Date").tail(days)
     if df.empty:
         return None
-    
-    y_true = df['y_true'].values
-    y_pred = df['y_pred'].values
-    
-    # Buy and hold
-    bah = np.cumprod(1 + y_true) - 1
-    
-    # Strategy: long when predicted positive, cash when negative
-    position = np.sign(y_pred)
-    position[position == 0] = 0
-    strategy_daily = y_true * position
-    strategy = np.cumprod(1 + strategy_daily) - 1
-    
-    fig = go.Figure()
-    
-    # Strategy line
-    fig.add_trace(go.Scatter(
-        x=df['Date'],
-        y=strategy * 100,
-        name='RAMT Strategy',
-        line=dict(color='#22c55e', width=2.5),
-        fill='tozeroy',
-        fillcolor='rgba(34, 197, 94, 0.1)'
-    ))
-    
-    # Buy and hold line
-    fig.add_trace(go.Scatter(
-        x=df['Date'],
-        y=bah * 100,
-        name='Buy & Hold',
-        line=dict(color='#3b82f6', width=2, dash='dash'),
-    ))
-    
-    # Zero line
-    fig.add_hline(
-        y=0, line_dash="dash",
-        line_color="#475569", line_width=1
+
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        subplot_titles=(
+            f"Daily returns — actual vs predicted ({days} d)",
+            "Direction match",
+        ),
+        vertical_spacing=0.12,
+        row_heights=[0.6, 0.4],
     )
-    
+    fig.add_trace(
+        go.Bar(
+            x=df["Date"],
+            y=df["y_true"] * 100,
+            name="Actual %",
+            marker_color=["#22c55e" if v > 0 else "#ef4444" for v in df["y_true"]],
+            opacity=0.65,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=df["y_pred"] * 100,
+            name="Predicted %",
+            line=dict(color="#f97316", width=2),
+            mode="lines",
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_hline(y=0, line_dash="dash", line_color="#475569", row=1, col=1)
+    correct = (np.sign(df["y_true"].values) == np.sign(df["y_pred"].values)).astype(int)
+    fig.add_trace(
+        go.Bar(
+            x=df["Date"],
+            y=correct,
+            marker_color=["#22c55e" if c == 1 else "#ef4444" for c in correct],
+            showlegend=False,
+        ),
+        row=2,
+        col=1,
+    )
     fig.update_layout(
-        title='Cumulative Returns — Strategy vs Buy & Hold (%)',
-        paper_bgcolor='#0f172a',
-        plot_bgcolor='#1e293b',
-        font=dict(color='#f1f5f9', size=12),
-        legend=dict(bgcolor='#1e293b', bordercolor='#334155'),
-        height=350,
-        margin=dict(t=50, b=20),
-        yaxis_title='Cumulative Return (%)',
-        xaxis_title='Date'
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0", size=11),
+        height=500,
+        margin=dict(t=40, b=20),
     )
-    
-    fig.update_xaxes(gridcolor='#334155')
-    fig.update_yaxes(gridcolor='#334155')
-    
+    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_yaxes(gridcolor="#1e293b")
     return fig
 
 
-def plot_regime_history(features_df, days=180):
-    """Plot regime history with colored background."""
-    if features_df is None:
+def plot_cumulative_returns(predictions_df: pd.DataFrame | None, ticker_code: str):
+    if predictions_df is None:
         return None
-    
-    df = features_df.tail(days).copy()
-    
-    if 'HMM_Regime' not in df.columns:
+    df = predictions_df[predictions_df["Ticker"] == ticker_code].copy().sort_values("Date")
+    if df.empty:
         return None
-    
-    fig = make_subplots(
-        rows=2, cols=1,
-        subplot_titles=(
-            'Price with Regime Background',
-            'Regime Timeline'
-        ),
-        vertical_spacing=0.12,
-        row_heights=[0.65, 0.35]
+    y_true = df["y_true"].values
+    y_pred = df["y_pred"].values
+    bah = np.cumprod(1 + y_true) - 1
+    position = np.sign(y_pred)
+    position[position == 0] = 0
+    strategy = np.cumprod(1 + y_true * position) - 1
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=strategy * 100,
+            name="Strategy",
+            line=dict(color="#4ade80", width=2),
+            fill="tozeroy",
+            fillcolor="rgba(74, 222, 128, 0.08)",
+        )
     )
-    
-    # Price line
-    if 'Close' in df.columns:
+    fig.add_trace(
+        go.Scatter(
+            x=df["Date"],
+            y=bah * 100,
+            name="Buy & hold",
+            line=dict(color="#38bdf8", width=2, dash="dash"),
+        )
+    )
+    fig.update_layout(
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0"),
+        height=340,
+        yaxis_title="Cumulative %",
+    )
+    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_yaxes(gridcolor="#1e293b")
+    return fig
+
+
+def plot_regime_history(features_df: pd.DataFrame | None, days: int = 180):
+    if features_df is None or "HMM_Regime" not in features_df.columns:
+        return None
+    df = features_df.tail(days).copy()
+    fig = make_subplots(
+        rows=2,
+        cols=1,
+        subplot_titles=("Price · regime tint", "Regime"),
+        vertical_spacing=0.12,
+        row_heights=[0.65, 0.35],
+    )
+    if "Close" in df.columns:
         fig.add_trace(
             go.Scatter(
                 x=df.index,
-                y=df['Close'],
-                name='Close Price',
-                line=dict(color='#f1f5f9', width=1.5)
+                y=df["Close"],
+                name="Close",
+                line=dict(color="#e2e8f0", width=1.2),
             ),
-            row=1, col=1
+            row=1,
+            col=1,
         )
-    
-    # Regime colored bars
-    regime_colors_map = {
-        0: 'rgba(249, 115, 22, 0.3)',
-        1: 'rgba(34, 197, 94, 0.3)',
-        2: 'rgba(239, 68, 68, 0.3)'
-    }
-    
-    # Add regime shading
-    prev_regime = None
-    start_date = None
-    
-    for date, row in df.iterrows():
-        regime = int(row['HMM_Regime'])
-        if regime != prev_regime:
-            if prev_regime is not None and start_date is not None:
-                fig.add_vrect(
-                    x0=start_date, x1=date,
-                    fillcolor=regime_colors_map[prev_regime],
-                    layer="below", line_width=0,
-                    row=1, col=1
-                )
-            start_date = date
-            prev_regime = regime
-    
-    # Regime bar chart
     fig.add_trace(
         go.Bar(
             x=df.index,
             y=[1] * len(df),
-            marker_color=[
-                REGIME_COLORS[int(r)] 
-                for r in df['HMM_Regime']
-            ],
-            name='Regime',
-            showlegend=False
+            marker_color=[REGIME_COLORS[int(r)] for r in df["HMM_Regime"]],
+            showlegend=False,
         ),
-        row=2, col=1
+        row=2,
+        col=1,
     )
-    
     fig.update_layout(
-        paper_bgcolor='#0f172a',
-        plot_bgcolor='#1e293b',
-        font=dict(color='#f1f5f9', size=12),
-        height=480,
-        margin=dict(t=50, b=20),
-        legend=dict(bgcolor='#1e293b')
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0"),
+        height=460,
     )
-    
-    fig.update_xaxes(gridcolor='#334155')
-    fig.update_yaxes(gridcolor='#334155')
-    
+    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_yaxes(gridcolor="#1e293b")
     return fig
 
 
-def _ranking_metrics(actual: np.ndarray, predicted: np.ndarray) -> dict:
-    """Scalar fit stats for ranking CSV (alpha as decimal returns)."""
-    if len(actual) < 2:
+def _ranking_metrics(act: np.ndarray, pred: np.ndarray) -> dict[str, float | int]:
+    if len(act) < 2:
         return {}
-    rmse = float(np.sqrt(np.mean((actual - predicted) ** 2)))
-    mae = float(np.mean(np.abs(actual - predicted)))
-    da = float(np.mean(np.sign(actual) == np.sign(predicted)) * 100)
-    corr = float(np.corrcoef(actual, predicted)[0, 1])
-    return {
-        "RMSE": round(rmse, 5),
-        "MAE": round(mae, 5),
-        "DA%": round(da, 2),
-        "ρ": round(corr, 3),
-        "n": int(len(actual)),
-    }
+    rmse = float(np.sqrt(np.mean((act - pred) ** 2)))
+    mae = float(np.mean(np.abs(act - pred)))
+    da = float(np.mean(np.sign(act) == np.sign(pred)) * 100)
+    corr = float(np.corrcoef(act, pred)[0, 1])
+    return {"RMSE": round(rmse, 5), "MAE": round(mae, 5), "DA%": round(da, 2), "ρ": round(corr, 3), "n": int(len(act))}
 
 
 def plot_ramt_ranking_predicted_vs_actual(
     rank_df: pd.DataFrame, ticker_code: str
-) -> tuple[go.Figure | None, dict]:
-    """
-    Professional validation view: time-aligned series + calibration scatter.
-    Expects columns Date, Ticker, predicted_alpha, actual_alpha.
-    """
+) -> tuple[go.Figure | None, dict[str, float | int]]:
     if rank_df is None or rank_df.empty:
         return None, {}
     need = {"Date", "predicted_alpha", "actual_alpha", "Ticker"}
     if not need.issubset(rank_df.columns):
         return None, {}
-
     d = rank_df[rank_df["Ticker"] == ticker_code].copy().sort_values("Date")
     if d.empty:
         return None, {}
-
     act = d["actual_alpha"].to_numpy(dtype=float)
     pred = d["predicted_alpha"].to_numpy(dtype=float)
     metrics = _ranking_metrics(act, pred)
-
     act_pct = act * 100.0
     pred_pct = pred * 100.0
     dates = d["Date"]
-
-    # Institutional palette (distinct, print-safe)
-    c_realized = "#1e40af"
-    c_realized_mk = "#3b82f6"
-    c_predicted = "#0f766e"
-    c_predicted_mk = "#14b8a6"
-    c_ref = "#78716c"
-    c_scatter = "#0d9488"
-    c_scatter_edge = "#ccfbf1"
-    grid = "#334155"
-    zero_ln = "#57534e"
 
     fig = make_subplots(
         rows=2,
         cols=1,
         row_heights=[0.54, 0.46],
-        vertical_spacing=0.20,
+        vertical_spacing=0.18,
         subplot_titles=(
-            f"<b>{ticker_code}</b> · Realized vs predicted α (rebalance dates)",
-            "<b>Calibration</b> · predicted vs realized α",
+            f"{ticker_code} · realized vs predicted α",
+            "Calibration",
         ),
     )
-
     fig.add_trace(
         go.Scatter(
             x=dates,
             y=act_pct,
             name="Realized α",
             mode="lines+markers",
-            line=dict(color=c_realized, width=2.25),
-            marker=dict(size=8, color=c_realized_mk, line=dict(width=0)),
-            hovertemplate="%{x|%Y-%m-%d}<br>Realized: %{y:.3f}%<extra></extra>",
+            line=dict(color="#3b82f6", width=2),
+            marker=dict(size=7),
         ),
         row=1,
         col=1,
@@ -715,300 +933,565 @@ def plot_ramt_ranking_predicted_vs_actual(
             y=pred_pct,
             name="Predicted α",
             mode="lines+markers",
-            line=dict(color=c_predicted, width=2.25),
-            marker=dict(size=8, color=c_predicted_mk, line=dict(width=0)),
-            hovertemplate="%{x|%Y-%m-%d}<br>Predicted: %{y:.3f}%<extra></extra>",
+            line=dict(color="#14b8a6", width=2),
+            marker=dict(size=7),
         ),
         row=1,
         col=1,
     )
-
     lo = float(min(act_pct.min(), pred_pct.min()))
     hi = float(max(act_pct.max(), pred_pct.max()))
-    span = hi - lo
-    pad = max(span * 0.12, 0.25)
+    pad = max((hi - lo) * 0.12, 0.25)
     lim_lo, lim_hi = lo - pad, hi + pad
-
     fig.add_trace(
         go.Scatter(
             x=[lim_lo, lim_hi],
             y=[lim_lo, lim_hi],
             mode="lines",
-            name="Perfect fit (y = x)",
-            line=dict(color=c_ref, dash="dash", width=1.25),
-            hoverinfo="skip",
+            name="y = x",
+            line=dict(color="#64748b", dash="dash"),
         ),
         row=2,
         col=1,
     )
-    date_str = dates.dt.strftime("%Y-%m-%d")
     fig.add_trace(
         go.Scatter(
             x=act_pct,
             y=pred_pct,
             mode="markers",
-            name="Rebalance observations",
-            marker=dict(
-                size=9,
-                color=c_scatter,
-                line=dict(width=1.25, color=c_scatter_edge),
-                opacity=0.92,
-            ),
-            text=date_str,
-            hovertemplate=(
-                "Realized: %{x:.3f}%<br>Predicted: %{y:.3f}%<br>%{text}<extra></extra>"
-            ),
+            marker=dict(size=8, color="#a78bfa", line=dict(width=1, color="#e9d5ff")),
+            text=dates.dt.strftime("%Y-%m-%d"),
+            hovertemplate="Realized %{x:.3f}% · Pred %{y:.3f}% · %{text}<extra></extra>",
         ),
         row=2,
         col=1,
     )
-
-    fig.update_xaxes(
-        title_text="Date",
-        title_standoff=18,
-        row=1,
-        col=1,
-        gridcolor=grid,
-        showgrid=True,
-        zeroline=False,
-        tickangle=-35,
-        automargin=True,
-        tickformat="%b %Y",
-        nticks=min(18, max(6, len(dates))),
-    )
-    fig.update_yaxes(
-        title_text="Alpha (%)",
-        title_standoff=14,
-        row=1,
-        col=1,
-        gridcolor=grid,
-        showgrid=True,
-        zeroline=True,
-        zerolinecolor=zero_ln,
-        automargin=True,
-    )
-    fig.update_xaxes(
-        title_text="Realized α (%)",
-        title_standoff=16,
-        row=2,
-        col=1,
-        gridcolor=grid,
-        range=[lim_lo, lim_hi],
-        showgrid=True,
-        zeroline=False,
-        automargin=True,
-    )
-    fig.update_yaxes(
-        title_text="Predicted α (%)",
-        title_standoff=14,
-        row=2,
-        col=1,
-        gridcolor=grid,
-        range=[lim_lo, lim_hi],
-        showgrid=True,
-        zeroline=False,
-        automargin=True,
-    )
-
     fig.update_layout(
-        height=760,
-        paper_bgcolor="#0f172a",
-        plot_bgcolor="#1e293b",
-        font=dict(color="#e2e8f0", size=12, family="Inter, ui-sans-serif, system-ui, sans-serif"),
-        showlegend=True,
-        legend=dict(
-            orientation="h",
-            yanchor="top",
-            y=-0.06,
-            x=0.5,
-            xanchor="center",
-            bgcolor="rgba(15,23,42,0.94)",
-            bordercolor="#475569",
-            borderwidth=1,
-            font=dict(size=11, color="#e2e8f0"),
-            tracegroupgap=24,
-        ),
-        margin=dict(l=64, r=40, t=96, b=112),
+        height=720,
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0", size=11),
+        margin=dict(l=56, r=32, t=80, b=96),
     )
-
-    for ann in fig.layout.annotations:
-        ann.font.size = 13
-        ann.font.color = "#f1f5f9"
-        ann.yshift = -8
-
+    fig.update_xaxes(gridcolor="#1e293b", row=1, col=1)
+    fig.update_yaxes(gridcolor="#1e293b", row=1, col=1)
+    fig.update_xaxes(title="Realized α %", gridcolor="#1e293b", row=2, col=1, range=[lim_lo, lim_hi])
+    fig.update_yaxes(title="Predicted α %", gridcolor="#1e293b", row=2, col=1, range=[lim_lo, lim_hi])
     return fig, metrics
 
 
-def plot_metrics_comparison(all_predictions, ticker_code):
-    """Bar chart comparing models on key metrics."""
+def plot_metrics_comparison(all_predictions: dict[str, pd.DataFrame], ticker_code: str):
     if not all_predictions:
         return None
-    
-    models_data = []
+    rows: list[dict[str, Any]] = []
     for model_name, pred_df in all_predictions.items():
-        ticker_df = pred_df[
-            pred_df['Ticker'] == ticker_code
-        ]
-        if ticker_df.empty:
+        t_df = pred_df[pred_df["Ticker"] == ticker_code]
+        if t_df.empty:
             continue
-        
-        metrics = compute_metrics(
-            ticker_df['y_true'].values,
-            ticker_df['y_pred'].values
-        )
-        metrics['Model'] = model_name
-        models_data.append(metrics)
-    
-    if not models_data:
+        m = compute_metrics(t_df["y_true"].values, t_df["y_pred"].values)
+        m["Model"] = model_name
+        rows.append(m)
+    if not rows:
         return None
-    
-    metrics_df = pd.DataFrame(models_data)
-    
+    metrics_df = pd.DataFrame(rows)
     fig = make_subplots(
-        rows=1, cols=2,
-        subplot_titles=(
-            'Directional Accuracy (%)',
-            'Sharpe Ratio'
-        )
+        rows=1,
+        cols=2,
+        subplot_titles=("Directional accuracy %", "Sharpe"),
     )
-    
-    colors = ['#3b82f6', '#22c55e', '#f97316']
-    
+    colors = ["#38bdf8", "#4ade80", "#f97316"]
     fig.add_trace(
         go.Bar(
-            x=metrics_df['Model'],
-            y=metrics_df['DA%'],
-            marker_color=colors[:len(metrics_df)],
-            name='DA%',
-            text=metrics_df['DA%'].round(2),
-            textposition='outside',
-            textfont=dict(color='#f1f5f9')
+            x=metrics_df["Model"],
+            y=metrics_df["DA%"],
+            marker_color=colors[: len(metrics_df)],
+            text=metrics_df["DA%"].round(2),
+            textposition="outside",
         ),
-        row=1, col=1
+        row=1,
+        col=1,
     )
-    
-    # Reference line at 50%
-    fig.add_hline(
-        y=50, line_dash="dash",
-        line_color="#ef4444", line_width=1,
-        annotation_text="Random (50%)",
-        annotation_font_color="#ef4444",
-        row=1, col=1
-    )
-    
+    fig.add_hline(y=50, line_dash="dash", line_color="#f87171", row=1, col=1)
     fig.add_trace(
         go.Bar(
-            x=metrics_df['Model'],
-            y=metrics_df['Sharpe'],
-            marker_color=colors[:len(metrics_df)],
-            name='Sharpe',
-            text=metrics_df['Sharpe'].round(2),
-            textposition='outside',
-            textfont=dict(color='#f1f5f9')
+            x=metrics_df["Model"],
+            y=metrics_df["Sharpe"],
+            marker_color=colors[: len(metrics_df)],
+            text=metrics_df["Sharpe"].round(2),
+            textposition="outside",
         ),
-        row=1, col=2
+        row=1,
+        col=2,
     )
-    
     fig.update_layout(
-        paper_bgcolor='#0f172a',
-        plot_bgcolor='#1e293b',
-        font=dict(color='#f1f5f9'),
+        paper_bgcolor="#0b1020",
+        plot_bgcolor="#111827",
+        font=dict(color="#e2e8f0"),
         height=300,
         showlegend=False,
-        margin=dict(t=40, b=20)
     )
-    
-    fig.update_xaxes(gridcolor='#334155')
-    fig.update_yaxes(gridcolor='#334155')
-    
+    fig.update_xaxes(gridcolor="#1e293b")
+    fig.update_yaxes(gridcolor="#1e293b")
     return fig
 
 
-# ─── Main App ────────────────────────────────────────────────
+def get_current_regime(df: pd.DataFrame | None) -> dict[str, Any] | None:
+    if df is None or "HMM_Regime" not in df.columns:
+        return None
+    last_regime = int(df["HMM_Regime"].iloc[-1])
+    regimes = df["HMM_Regime"].values
+    days_in_regime = 1
+    for i in range(len(regimes) - 2, -1, -1):
+        if int(regimes[i]) == last_regime:
+            days_in_regime += 1
+        else:
+            break
+    recent = df["HMM_Regime"].tail(60)
+    total = len(recent)
+    bull_pct = float((recent == 1).sum() / total * 100)
+    bear_pct = float((recent == 2).sum() / total * 100)
+    hv_pct = float((recent == 0).sum() / total * 100)
+    return {
+        "current": last_regime,
+        "name": REGIME_NAMES[last_regime],
+        "color": REGIME_COLORS[last_regime],
+        "days": days_in_regime,
+        "bull_pct": bull_pct,
+        "bear_pct": bear_pct,
+        "hv_pct": hv_pct,
+    }
 
-def main():
-    
-    # ── Sidebar ──────────────────────────────────────────────
-    with st.sidebar:
-        st.markdown("## 📈 RAMT Dashboard")
-        st.markdown("---")
-        
-        # Ticker selector
-        selected_display = st.selectbox(
-            "Select Stock",
-            list(TICKERS.keys()),
-            index=0
+
+# ─── Live market pulse & RAMT inference ────────────────────
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_live_macro_data_cached() -> dict[str, Any]:
+    """Hourly cache — keeps demos snappy on repeated clicks."""
+    from dashboard.market_pulse import fetch_live_macro_data_engine
+
+    return fetch_live_macro_data_engine()
+
+
+def _flatten_yfinance_hist(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    if isinstance(out.columns, pd.MultiIndex):
+        out.columns = out.columns.get_level_values(0)
+    out.columns = [str(c).strip() for c in out.columns]
+    return out
+
+
+def stem_to_yfinance_symbol(stem: str) -> str:
+    if stem.endswith("_NS"):
+        return stem[:-3] + ".NS"
+    return stem
+
+
+def compute_live_stock_feature_row(stem: str) -> pd.Series | None:
+    """Last row of price/tech/volume features from yfinance (same helpers as training)."""
+    from features.feature_engineering import (
+        add_bollinger_distance,
+        add_returns_features,
+        add_rsi_14,
+        add_volume_surge,
+    )
+
+    sym = stem_to_yfinance_symbol(stem)
+    try:
+        hist = yf.Ticker(sym).history(period="1y", interval="1d", auto_adjust=False)
+    except Exception:
+        return None
+    if hist is None or hist.empty or len(hist) < 30:
+        return None
+    h = _flatten_yfinance_hist(hist).rename_axis("Date").reset_index()
+    if "Adj Close" not in h.columns and "Close" in h.columns:
+        h["Adj Close"] = h["Close"].astype(float)
+    if "Adj Close" not in h.columns:
+        return None
+    for col in ("Open", "High", "Low", "Close"):
+        if col not in h.columns:
+            h[col] = h["Adj Close"]
+    if "Volume" not in h.columns:
+        h["Volume"] = 1.0
+    h["Date"] = pd.to_datetime(h["Date"]).dt.tz_localize(None)
+    h = add_returns_features(h)
+    h = add_rsi_14(h)
+    h = add_bollinger_distance(h)
+    h = add_volume_surge(h)
+    req = set(PRICE_COLS + TECH_COLS + VOLUME_COLS)
+    h = h.dropna(subset=list(req))
+    if h.empty:
+        return None
+    return h.iloc[-1]
+
+
+def build_live_ramt_sequence(
+    ticker_stem: str,
+    root: Path,
+    macro_pack: dict[str, Any],
+) -> tuple[np.ndarray, int] | None:
+    """
+    Build raw (unscaled) 30×F feature tensor: 29 historical rows from Parquet + 1 live row.
+    Live row = latest stock features (yfinance) + macro from macro_pack (training-aligned).
+    """
+    pq = root / "data" / "processed" / f"{ticker_stem}_features.parquet"
+    if not pq.is_file():
+        return None
+    raw = pd.read_parquet(pq)
+    raw["Date"] = pd.to_datetime(raw["Date"])
+    raw = raw.sort_values("Date")
+    if len(raw) < 30:
+        return None
+    miss = [c for c in ALL_FEATURE_COLS if c not in raw.columns]
+    if miss:
+        return None
+
+    base = raw[ALL_FEATURE_COLS].values.astype(np.float32)
+    feats = macro_pack.get("macro_features") or {}
+    srow = compute_live_stock_feature_row(ticker_stem)
+
+    idx = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
+    live = np.zeros(len(ALL_FEATURE_COLS), dtype=np.float32)
+
+    if srow is not None:
+        for c in PRICE_COLS + TECH_COLS + VOLUME_COLS:
+            live[idx[c]] = float(srow[c])
+    else:
+        live = base[-1].copy()
+
+    for c in MACRO_COLS:
+        v = feats.get(c, float("nan"))
+        if not np.isfinite(v):
+            v = float(base[-1, idx[c]])
+        live[idx[c]] = v
+
+    seq = np.vstack([base[-30:-1], live.reshape(1, -1)])
+    regime = int(np.clip(int(round(float(raw["HMM_Regime"].iloc[-1]))), 0, 2))
+    return seq.astype(np.float32), regime
+
+
+def apply_predictor_form_to_last_row(
+    seq_unscaled: np.ndarray,
+    ret_1d_pct: float,
+    mom_20_pct: float,
+    rsi: float,
+    bb_dist: float,
+    vol_surge: float,
+) -> np.ndarray:
+    """Optional manual tweaks — map % returns to log features like the pipeline."""
+    out = seq_unscaled.copy()
+    last = out[-1].copy()
+    idx = {c: i for i, c in enumerate(ALL_FEATURE_COLS)}
+    r1 = ret_1d_pct / 100.0
+    last[idx["Ret_1d"]] = float(np.log1p(r1)) if r1 > -0.999 else last[idx["Ret_1d"]]
+    m20 = mom_20_pct / 100.0
+    last[idx["Ret_21d"]] = float(np.log1p(m20)) if m20 > -0.999 else last[idx["Ret_21d"]]
+    last[idx["RSI_14"]] = float(rsi)
+    last[idx["BB_Dist"]] = float(bb_dist)
+    last[idx["Volume_Surge"]] = float(vol_surge)
+    out[-1] = last
+    return out
+
+
+def run_ramt_live_predict(
+    ticker_stem: str,
+    root: Path,
+    macro_pack: dict[str, Any],
+    ret_1d_pct: float,
+    mom_20_pct: float,
+    rsi: float,
+    bb_dist: float,
+    vol_surge: float,
+    regime_id: int,
+) -> tuple[float | None, float | None, str]:
+    """
+    Load RobustScaler + checkpoint, scale inputs, run model.forward.
+    Returns (monthly_pred, daily_pred, status_message).
+    """
+    scaler_path = root / "results" / "ramt_scaler.joblib"
+    y_scaler_path = root / "results" / "ramt_y_scaler.joblib"
+    state_path = root / "results" / "ramt_model_state.pt"
+    if not scaler_path.is_file() or not state_path.is_file():
+        return None, None, "missing_artifacts"
+
+    built = build_live_ramt_sequence(ticker_stem, root, macro_pack)
+    if built is None:
+        return None, None, "no_sequence"
+    seq_unscaled, _reg_parquet = built
+    seq_unscaled = apply_predictor_form_to_last_row(
+        seq_unscaled, ret_1d_pct, mom_20_pct, rsi, bb_dist, vol_surge
+    )
+
+    scaler = joblib.load(scaler_path)
+    X = scaler.transform(seq_unscaled).astype(np.float32)
+    X_t = torch.from_numpy(X).unsqueeze(0)
+    regime = int(np.clip(regime_id, 0, 2))
+    r = torch.tensor([regime], dtype=torch.long)
+    tid = torch.tensor([int(TICKER_TO_ID.get(ticker_stem, 0))], dtype=torch.long)
+
+    try:
+        payload = torch.load(state_path, map_location="cpu", weights_only=False)
+    except TypeError:
+        payload = torch.load(state_path, map_location="cpu")
+    cfg = payload.get("config") or {"seq_len": 30}
+    model = build_ramt(cfg)
+    model.load_state_dict(payload["model_state_dict"], strict=True)
+    model.eval()
+
+    with torch.no_grad():
+        pred_m, pred_d, _gw = model(X_t, r, ticker_id=tid)
+
+    pm = float(pred_m.squeeze().cpu().numpy())
+    pd_ = float(pred_d.squeeze().cpu().numpy())
+
+    if y_scaler_path.is_file():
+        try:
+            y_scaler = joblib.load(y_scaler_path)
+            pm = float(y_scaler.inverse_transform(np.array([[pm]]))[0, 0])
+        except Exception:
+            pass
+
+    return pm, pd_, "ok"
+
+
+def render_live_predictor_section(state: SidebarState) -> None:
+    st.markdown("---")
+    st.markdown("### Live predictor")
+    st.caption(
+        "One-click **market pulse** (VIX, crude, NIFTY trend, USD/INR) + RAMT forward pass "
+        "with the same **RobustScaler** as training."
+    )
+
+    b1, b2 = st.columns([1, 2])
+    with b1:
+        if st.button("⚡ Auto-Fill with Current Market Data", key="btn_autofill_market"):
+            with st.spinner("Fetching Market Pulse…"):
+                pack = fetch_live_macro_data_cached()
+            st.session_state["lp_macro_pack"] = pack
+            st.session_state["lp_fetch_utc"] = datetime.now(timezone.utc).isoformat()
+            if pack.get("ok"):
+                st.session_state["lp_ret_1d_pct"] = float(pack.get("nifty_ret_1d_pct", 0.0))
+                st.session_state["lp_mom_20_pct"] = float(pack.get("nifty_mom_20_pct", 0.0))
+                srow = compute_live_stock_feature_row(state.ticker_code)
+                if srow is not None:
+                    st.session_state["lp_rsi"] = float(srow["RSI_14"])
+                    st.session_state["lp_bb"] = float(srow["BB_Dist"])
+                    st.session_state["lp_vol"] = float(srow["Volume_Surge"])
+                pq = ROOT / "data" / "processed" / f"{state.ticker_code}_features.parquet"
+                if pq.is_file():
+                    rdf = pd.read_parquet(pq, columns=["HMM_Regime"])
+                    st.session_state["lp_regime"] = int(
+                        np.clip(int(round(float(rdf["HMM_Regime"].iloc[-1]))), 0, 2)
+                    )
+                st.session_state["lp_vix"] = float(pack.get("vix_level", float("nan")))
+                st.session_state["lp_crude"] = float(pack.get("crude_level", float("nan")))
+                st.session_state["lp_inr"] = float(pack.get("inr_level", float("nan")))
+            st.rerun()
+
+    with b2:
+        fu = st.session_state.get("lp_fetch_utc")
+        if fu:
+            st.caption(f"Last updated (UTC): **{fu}** · cache TTL 1h")
+        else:
+            st.caption("Last updated: — (click auto-fill)")
+
+    pack = st.session_state.get("lp_macro_pack")
+    if pack and pack.get("ok") and pack.get("stale"):
+        st.warning(
+            "Data is **last available** (not real-time) — market may be closed or the feed delayed."
         )
-        ticker_code = TICKERS[selected_display]
-        
-        st.markdown("---")
-        
-        # Model selector
-        available_models = []
-        for name in ['xgboost', 'lstm', 'ramt']:
-            path = ROOT / f"results/{name}_predictions.csv"
-            if path.exists():
-                available_models.append(name.upper())
-        
-        if available_models:
-            selected_model = st.selectbox(
-                "Primary Model",
-                available_models,
-                index=0
+        d0 = pack.get("latest_data_date")
+        if d0 is not None:
+            st.caption(f"Latest bar across series: **{pd.Timestamp(d0).date()}**")
+    elif pack and not pack.get("ok"):
+        st.warning(
+            pack.get("error") or "Market data fetch failed — using manual inputs only."
+        )
+
+    st.caption(
+        f"Spot checks · VIX: `{st.session_state.get('lp_vix', '—')}` · "
+        f"Crude: `{st.session_state.get('lp_crude', '—')}` · "
+        f"INR: `{st.session_state.get('lp_inr', '—')}`"
+    )
+
+    with st.form("live_predictor_form"):
+        c1, c2 = st.columns(2)
+        with c1:
+            ret_pct = st.number_input(
+                "Today's return — NIFTY 50 (%)",
+                value=float(st.session_state.get("lp_ret_1d_pct", 0.0)),
+                format="%.4f",
+                help="Index 1-day return; drives Ret_1d after log transform.",
+            )
+            mom_pct = st.number_input(
+                "20-day momentum — NIFTY 50 (%)",
+                value=float(st.session_state.get("lp_mom_20_pct", 0.0)),
+                format="%.4f",
+                help="Mapped to Ret_21d slot (≈21d horizon in features).",
+            )
+            rsi = st.number_input(
+                "RSI (14) — stock",
+                min_value=0.0,
+                max_value=100.0,
+                value=float(st.session_state.get("lp_rsi", 50.0)),
+            )
+        with c2:
+            bb = st.number_input(
+                "BB distance (20d) — stock",
+                value=float(st.session_state.get("lp_bb", 0.0)),
+                format="%.4f",
+            )
+            vol = st.number_input(
+                "Volume surge — stock",
+                min_value=0.01,
+                max_value=10.0,
+                value=float(st.session_state.get("lp_vol", 1.0)),
+            )
+            regime = st.selectbox(
+                "HMM regime",
+                options=[0, 1, 2],
+                format_func=lambda x: REGIME_NAMES[x],
+                index=int(st.session_state.get("lp_regime", 1)),
+            )
+
+        go_btn = st.form_submit_button("Run RAMT (scaled inference)", use_container_width=True)
+
+    macro_for_predict = st.session_state.get("lp_macro_pack") or {}
+    if go_btn:
+        if not macro_for_predict.get("ok"):
+            st.info(
+                "Macro columns will use **Parquet fallbacks** until a successful auto-fill "
+                "(live Macro_* need yfinance)."
+            )
+        with st.spinner("Running RobustScaler + model.forward…"):
+            pm, pd_, status = run_ramt_live_predict(
+                state.ticker_code,
+                ROOT,
+                macro_for_predict,
+                ret_pct,
+                mom_pct,
+                rsi,
+                bb,
+                vol,
+                int(regime),
+            )
+        if status == "missing_artifacts":
+            st.info(
+                "Train RAMT to create `results/ramt_model_state.pt` and "
+                "`results/ramt_scaler.joblib` (e.g. `python models/run_final_2024_2026.py`)."
+            )
+        elif status == "no_sequence":
+            st.warning(f"Could not build a sequence for `{state.ticker_code}` — check Parquet.")
+        elif status == "ok" and pm is not None:
+            st.success(
+                f"**Monthly head (α-space):** {pm:.6f} · **Daily head:** {pd_:.6f} · "
+                f"**Regime:** {REGIME_NAMES.get(int(regime), regime)}"
+            )
+            st.caption(
+                "Monthly head matches ranking training target (excess vs NIFTY); "
+                "inverse y-scaler applied when `ramt_y_scaler.joblib` exists."
             )
         else:
-            selected_model = "XGBOOST"
-            st.warning("No prediction files found")
-        
-        st.markdown("---")
-        
-        # Days selector
-        days = st.slider(
-            "Chart History (days)",
-            min_value=30,
-            max_value=365,
-            value=120,
-            step=30
+            st.error("Inference failed unexpectedly.")
+
+
+# ─── Tab content ─────────────────────────────────────────────
+def render_live_performance_tab(
+    data: dict[str, Any],
+    state: SidebarState,
+    ranking_df: pd.DataFrame | None,
+    ranking_slice: pd.DataFrame,
+    full_slice: pd.DataFrame,
+    sim_window: dict[str, Any] | None,
+    sim_full: dict[str, Any] | None,
+    metrics_win: dict[str, float],
+    metrics_full: dict[str, float],
+    features_df: pd.DataFrame | None,
+    regime_info: dict[str, Any] | None,
+    shadow_df: pd.DataFrame,
+    shadow_regime: int | None,
+) -> None:
+    st.markdown("### Live performance")
+    st.caption(
+        "Window metrics recompute from the selected dates; deltas compare to the full "
+        "available backtest (same test-only filter)."
+    )
+
+    c1, c2, c3 = st.columns(3)
+    da_d = metrics_win["DA%"] - metrics_full["DA%"]
+    sh_d = metrics_win["Sharpe"] - metrics_full["Sharpe"]
+    md_d = metrics_win["MaxDD"] - metrics_full["MaxDD"]
+    c1.metric(
+        "Directional accuracy",
+        f"{metrics_win['DA%']:.2f}%",
+        delta=f"{da_d:+.2f} pp vs full",
+        delta_color="normal",
+    )
+    c2.metric(
+        "Sharpe (rebalance α)",
+        f"{metrics_win['Sharpe']:.3f}",
+        delta=f"{sh_d:+.3f} vs full",
+    )
+    c3.metric(
+        "Max drawdown",
+        f"{metrics_win['MaxDD']*100:.2f}%",
+        delta=f"{md_d*100:+.2f} pp vs full",
+    )
+
+    st.markdown("---")
+    st.markdown("### Model conviction (shadow picks)")
+    st.caption(
+        "Top 5 by **predicted_alpha** on the as-of date — informational only; "
+        "not the live position sizing rule."
+    )
+    if shadow_regime == 2:
+        st.markdown(
+            '<div class="shadow-badge-bear">STATUS: PROTECTIVE CASH (0%)</div>',
+            unsafe_allow_html=True,
         )
-        
-        st.markdown("---")
-        st.markdown("### Project Info")
-        st.markdown("**RAMT** — Regime-Adaptive")
-        st.markdown("Multimodal Transformer")
-        st.markdown("Rishihood University")
-        
-        st.markdown("---")
-        if st.button("🔄 Refresh Data"):
-            st.cache_data.clear()
-            st.rerun()
-    
-    # ── Load Data ─────────────────────────────────────────────
-    features_df = load_features(ticker_code)
-    regime_info = get_current_regime(features_df)
-    rankings_df = load_monthly_rankings()
-    bt_df = load_backtest_results()
-    ranking_preds_df = load_ranking_predictions()
-    all_predictions = load_all_predictions()
-    primary_preds = load_predictions(selected_model.lower())
+        st.caption(
+            "BEAR regime would map to cash in the production rules; the table still "
+            "shows model rankings to verify the transformer remains active."
+        )
 
-    # ── Header ────────────────────────────────────────────────
-    st.markdown("# 📈 RAMT Portfolio Dashboard")
-    st.markdown("---")
-
-    show_portfolio_signals(regime_info, rankings_df)
+    if shadow_df is not None and not shadow_df.empty:
+        disp = shadow_df.copy()
+        disp["predicted_alpha"] = (disp["predicted_alpha"] * 100).map(lambda x: f"{x:.3f}%")
+        disp["actual_alpha"] = (disp["actual_alpha"] * 100).map(lambda x: f"{x:.3f}%")
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+    else:
+        st.info("No ranking rows for this as-of date.")
 
     st.markdown("---")
-    st.markdown("### 📈 Portfolio vs NIFTY (paper trading)")
+    rc1, rc2 = st.columns(2)
+    with rc1:
+        if regime_info:
+            st.metric("Latest HMM regime (ticker file)", regime_info["name"])
+    with rc2:
+        if shadow_regime is not None:
+            st.metric("Regime at as-of (NIFTY)", REGIME_NAMES.get(shadow_regime, "?"))
+
+    st.markdown("---")
+    st.markdown("### Equity curve")
+    render_charts(sim_window, data.get("regime_series"))
+
+    if sim_window and sim_window.get("rows_detail") is not None and not sim_window["rows_detail"].empty:
+        with st.expander("Rebalance detail (window)"):
+            rd = sim_window["rows_detail"].drop(columns=["tickers_list"], errors="ignore")
+            st.dataframe(rd, use_container_width=True, hide_index=True)
+
+    render_live_predictor_section(state)
+
+    st.markdown("#### Saved backtest (`run_final` daily engine)")
+    bt_df = data.get("backtest_results")
     if bt_df is None or bt_df.empty:
-        st.info("No backtest results yet. Run `python models/run_final_2024_2026.py` first.")
+        st.caption("Optional: run `run_final` to populate `results/backtest_results.csv`.")
     else:
         fig = go.Figure()
         fig.add_trace(
             go.Scatter(
                 x=bt_df["date"],
                 y=bt_df.get("portfolio_value", (1 + bt_df["cumulative_return"]) * 100000),
-                name="Portfolio value (₹)",
-                line=dict(color="#22c55e", width=2.5),
+                name="Portfolio ₹",
+                line=dict(color="#4ade80", width=2),
             )
         )
         if "nifty_value" in bt_df.columns:
@@ -1016,334 +1499,279 @@ def main():
                 go.Scatter(
                     x=bt_df["date"],
                     y=bt_df["nifty_value"],
-                    name="NIFTY value (₹)",
-                    line=dict(color="#3b82f6", width=2, dash="dash"),
+                    name="NIFTY ₹",
+                    line=dict(color="#38bdf8", width=2, dash="dash"),
                 )
             )
         fig.update_layout(
-            paper_bgcolor="#0f172a",
-            plot_bgcolor="#1e293b",
-            font=dict(color="#f1f5f9"),
-            height=380,
-            margin=dict(t=30, b=20, l=10, r=10),
-            yaxis_title="Value (₹)",
-            xaxis_title="Month",
-            legend=dict(bgcolor="#1e293b", bordercolor="#334155"),
+            paper_bgcolor="#0b1020",
+            plot_bgcolor="#111827",
+            font=dict(color="#e2e8f0"),
+            height=360,
         )
-        fig.update_xaxes(gridcolor="#334155")
-        fig.update_yaxes(gridcolor="#334155")
+        fig.update_xaxes(gridcolor="#1e293b")
+        fig.update_yaxes(gridcolor="#1e293b")
         st.plotly_chart(fig, use_container_width=True)
 
-        st.markdown("### 🧾 Trade history")
-        trade_cols = ["date", "regime", "portfolio_return", "stocks_held", "cash"]
-        show_cols = [c for c in trade_cols if c in bt_df.columns]
-        st.dataframe(bt_df[show_cols].tail(24), use_container_width=True, hide_index=True)
-    
+
+def render_training_analytics_tab(
+    state: SidebarState,
+    ranking_preds_df: pd.DataFrame | None,
+    ranking_slice: pd.DataFrame,
+    all_predictions: dict[str, pd.DataFrame],
+    features_df: pd.DataFrame | None,
+) -> None:
+    train_png = ROOT / "results" / "training_dashboard.png"
+    train_csv = ROOT / "results" / "training_history.csv"
+    if train_png.is_file():
+        st.markdown("### Training run")
+        st.caption("Blind-split RAMT — loss, LR, generalization gap.")
+        st.image(str(train_png), use_container_width=True)
+        if train_csv.is_file():
+            st.download_button(
+                label="Download training_history.csv",
+                data=train_csv.read_bytes(),
+                file_name="training_history.csv",
+                mime="text/csv",
+            )
+    else:
+        st.info("No `results/training_dashboard.png` — run training to populate.")
+
     st.markdown("---")
-    st.markdown("### RAMT predicted vs actual (out-of-sample)")
-    st.caption(
-        "Uses `results/ranking_predictions.csv` from walk-forward or fixed-train RAMT. "
-        "Alpha is shown as percent per rebalance date."
-    )
+    st.markdown("### RAMT predicted vs actual (ranking α)")
     fig_ramt, ramt_m = plot_ramt_ranking_predicted_vs_actual(
-        ranking_preds_df, ticker_code
+        ranking_slice if ranking_slice is not None and not ranking_slice.empty else ranking_preds_df,
+        state.ticker_code,
     )
     if fig_ramt is None:
-        st.info(
-            "No ranking predictions for this ticker yet. Run training "
-            "(`python models/run_final_2024_2026.py` or `models/ramt/train_ranking.py`) "
-            "so `results/ranking_predictions.csv` exists and includes this symbol."
-        )
+        st.warning("No ranking predictions for this ticker in the current slice.")
     else:
         mcols = st.columns(5)
-        mcols[0].metric("Direction accuracy", f"{ramt_m.get('DA%', 0):.2f}%")
+        mcols[0].metric("DA%", f"{ramt_m.get('DA%', 0):.2f}")
         mcols[1].metric("RMSE", f"{ramt_m.get('RMSE', 0):.5f}")
         mcols[2].metric("MAE", f"{ramt_m.get('MAE', 0):.5f}")
-        mcols[3].metric("Correlation ρ", f"{ramt_m.get('ρ', 0):.3f}")
-        mcols[4].metric("Observations", f"{ramt_m.get('n', 0)}")
+        mcols[3].metric("ρ", f"{ramt_m.get('ρ', 0):.3f}")
+        mcols[4].metric("n", f"{ramt_m.get('n', 0)}")
         st.plotly_chart(fig_ramt, use_container_width=True)
 
     st.markdown("---")
-    
-    # ── Row 6: Model Comparison + Live Predictor ──────────────
-    col_metrics, col_predictor = st.columns([1, 1])
-    
-    with col_metrics:
-        st.markdown("### 🏆 Model Comparison")
-        
-        fig_comp = plot_metrics_comparison(
-            all_predictions, ticker_code
-        )
-        if fig_comp:
-            st.plotly_chart(fig_comp, use_container_width=True)
-        
-        # Metrics table
-        if all_predictions:
-            rows = []
-            for model_name, pred_df in all_predictions.items():
-                t_df = pred_df[
-                    pred_df['Ticker'] == ticker_code
-                ]
-                if t_df.empty:
-                    continue
-                m = compute_metrics(
-                    t_df['y_true'].values,
-                    t_df['y_pred'].values
-                )
-                m['Model'] = model_name
-                rows.append(m)
-            
-            if rows:
-                metrics_table = pd.DataFrame(rows)
-                metrics_table = metrics_table.set_index('Model')
-                
-                st.dataframe(
-                    metrics_table.style
-                    .format({
-                        'RMSE': '{:.4f}',
-                        'MAE': '{:.4f}',
-                        'DA%': '{:.2f}%',
-                        'Sharpe': '{:.2f}',
-                        'MaxDD': '{:.4f}'
-                    })
-                    .background_gradient(
-                        subset=['DA%'],
-                        cmap='RdYlGn',
-                        vmin=49,
-                        vmax=56
-                    )
-                    .background_gradient(
-                        subset=['Sharpe'],
-                        cmap='RdYlGn',
-                        vmin=-1,
-                        vmax=2
-                    ),
-                    use_container_width=True
-                )
-    
-    with col_predictor:
-        st.markdown("### 🔮 Live Predictor")
-        st.markdown(
-            "Input today's values to get tomorrow's prediction"
-        )
-        
-        # Auto-fill button
-        if st.button("📥 Auto-fill Latest Data"):
-            if features_df is not None:
-                last_row = features_df.iloc[-1]
-                st.session_state['return_lag1'] = float(
-                    last_row.get('Return_Lag_1', 0)
-                )
-                st.session_state['rsi'] = float(
-                    last_row.get('RSI_14', 50)
-                )
-                st.session_state['macd'] = float(
-                    last_row.get('MACD', 0)
-                )
-                st.session_state['vol_ratio'] = float(
-                    last_row.get('Vol_Ratio', 1)
-                )
-                st.session_state['regime'] = int(
-                    last_row.get('HMM_Regime', 1)
-                )
-                st.success(
-                    f"Filled with data from "
-                    f"{features_df.index[-1]}"
-                )
-        
-        with st.form("prediction_form"):
-            c1, c2 = st.columns(2)
-            
-            with c1:
-                return_lag1 = st.number_input(
-                    "Today's Return (%)",
-                    value=st.session_state.get(
-                        'return_lag1', 0.0
-                    ) * 100,
-                    step=0.1,
-                    format="%.3f"
-                ) / 100
-                
-                rsi = st.number_input(
-                    "RSI (14-day)",
-                    min_value=0.0,
-                    max_value=100.0,
-                    value=float(
-                        st.session_state.get('rsi', 50.0)
-                    ),
-                    step=1.0
-                )
-                
-                vol_ratio = st.number_input(
-                    "Vol Ratio (5d/20d)",
-                    min_value=0.0,
-                    max_value=5.0,
-                    value=float(
-                        st.session_state.get('vol_ratio', 1.0)
-                    ),
-                    step=0.1
-                )
-            
-            with c2:
-                macd = st.number_input(
-                    "MACD",
-                    value=float(
-                        st.session_state.get('macd', 0.0)
-                    ),
-                    step=0.01,
-                    format="%.4f"
-                )
-                
-                regime = st.selectbox(
-                    "HMM Regime",
-                    options=[0, 1, 2],
-                    format_func=lambda x: REGIME_NAMES[x],
-                    index=int(
-                        st.session_state.get('regime', 1)
-                    )
-                )
-                
-                momentum_20 = st.number_input(
-                    "20-day Momentum (%)",
-                    value=0.0,
-                    step=0.5,
-                    format="%.2f"
-                ) / 100
-            
-            submitted = st.form_submit_button(
-                "🚀 Get Prediction",
-                use_container_width=True
-            )
-        
-        if submitted:
-            # Simple heuristic prediction
-            # Based on feature importance from XGBoost results
-            score = (
-                momentum_20 * 0.25 +
-                return_lag1 * 0.20 +
-                macd * 0.15 +
-                (rsi - 50) / 100 * 0.10 +
-                (1 - vol_ratio) * 0.10
-            )
-            
-            # Regime adjustment
-            if regime == 1:  # Bull
-                score *= 1.2
-            elif regime == 2:  # Bear
-                score *= 0.6
-            else:  # High vol
-                score *= 0.4
-            
-            pred_pct = score * 100
-            
-            if pred_pct > 0.3:
-                signal = "🟢 BUY"
-                box_class = "buy-signal"
-                action = f"Consider buying {selected_display}"
-            elif pred_pct < -0.3:
-                signal = "🔴 SELL / AVOID"
-                box_class = "sell-signal"
-                action = f"Avoid or reduce {selected_display}"
-            else:
-                signal = "🟡 HOLD / WEAK"
-                box_class = "hold-signal"
-                action = "Signal too weak to act"
-            
-            st.markdown(
-                f"<div class='{box_class}'>"
-                f"{signal}<br>"
-                f"<span style='font-size:14px;font-weight:normal'>"
-                f"Predicted return: {pred_pct:+.3f}%<br>"
-                f"Regime: {REGIME_NAMES[regime]}<br>"
-                f"Action: {action}<br>"
-                f"Stop loss if buying: 7% below entry"
-                f"</span></div>",
-                unsafe_allow_html=True
-            )
-            
-            # Warning
-            st.warning(
-                "⚠️ This prediction uses a heuristic model. "
-                "Always do your own research before trading."
-            )
-    
-    st.markdown("---")
-    
-    # ── Row 7: Raw Data Table ─────────────────────────────────
-    with st.expander("📊 View Raw Prediction Data"):
-        if primary_preds is not None and {"y_true", "y_pred"}.issubset(
-            primary_preds.columns
-        ):
-            t_df = primary_preds[
-                primary_preds['Ticker'] == ticker_code
-            ].tail(50).sort_values('Date', ascending=False)
-            
-            t_df['Direction_Correct'] = (
-                np.sign(t_df['y_true']) == 
-                np.sign(t_df['y_pred'])
-            )
-            t_df['y_true_pct'] = (t_df['y_true'] * 100).round(3)
-            t_df['y_pred_pct'] = (t_df['y_pred'] * 100).round(3)
-            
-            display_cols = [
-                'Date', 'y_true_pct', 
-                'y_pred_pct', 'Direction_Correct'
-            ]
-            
-            st.dataframe(
-                t_df[display_cols].rename(columns={
-                    'y_true_pct': 'Actual (%)',
-                    'y_pred_pct': 'Predicted (%)',
-                    'Direction_Correct': 'Correct?'
-                }),
-                use_container_width=True,
-                height=300
-            )
-        elif ranking_preds_df is not None and not ranking_preds_df.empty:
-            t_df = ranking_preds_df[
-                ranking_preds_df["Ticker"] == ticker_code
-            ].tail(50).sort_values("Date", ascending=False)
+    st.markdown("### Model comparison")
+    fig_comp = plot_metrics_comparison(all_predictions, state.ticker_code)
+    if fig_comp:
+        st.plotly_chart(fig_comp, use_container_width=True)
+    if all_predictions:
+        rows = []
+        for model_name, pred_df in all_predictions.items():
+            t_df = pred_df[pred_df["Ticker"] == state.ticker_code]
             if t_df.empty:
-                st.info("No ranking rows for this ticker.")
-            else:
-                t_df = t_df.copy()
-                t_df["Direction_Correct"] = (
-                    np.sign(t_df["actual_alpha"])
-                    == np.sign(t_df["predicted_alpha"])
-                )
-                t_df["actual_pct"] = (t_df["actual_alpha"] * 100).round(3)
-                t_df["pred_pct"] = (t_df["predicted_alpha"] * 100).round(3)
-                st.dataframe(
-                    t_df[
-                        ["Date", "actual_pct", "pred_pct", "Direction_Correct"]
-                    ].rename(
-                        columns={
-                            "actual_pct": "Actual (%)",
-                            "pred_pct": "Predicted (%)",
-                            "Direction_Correct": "Correct?",
-                        }
-                    ),
-                    use_container_width=True,
-                    height=300,
-                )
-        else:
-            st.info(
-                "No `results/*_predictions.csv` or ranking predictions file found."
+                continue
+            m = compute_metrics(t_df["y_true"].values, t_df["y_pred"].values)
+            m["Model"] = model_name
+            rows.append(m)
+        if rows:
+            mt = pd.DataFrame(rows).set_index("Model")
+            st.dataframe(
+                mt.style.format(
+                    {
+                        "RMSE": "{:.4f}",
+                        "MAE": "{:.4f}",
+                        "DA%": "{:.2f}%",
+                        "Sharpe": "{:.2f}",
+                        "MaxDD": "{:.4f}",
+                    }
+                ),
+                use_container_width=True,
             )
-    
-    # ── Footer ────────────────────────────────────────────────
+
+    st.markdown("---")
+    st.markdown("### Ticker charts")
+    primary_preds = load_predictions(state.selected_model.lower())
+    c1, c2 = st.columns(2)
+    with c1:
+        f1 = plot_actual_vs_predicted(primary_preds, state.ticker_code, state.chart_days)
+        if f1:
+            st.plotly_chart(f1, use_container_width=True)
+    with c2:
+        f2 = plot_cumulative_returns(primary_preds, state.ticker_code)
+        if f2:
+            st.plotly_chart(f2, use_container_width=True)
+    f3 = plot_regime_history(features_df, days=min(180, state.chart_days + 60))
+    if f3:
+        st.plotly_chart(f3, use_container_width=True)
+
+
+def render_raw_data_explorer_tab(
+    state: SidebarState,
+    primary_preds: pd.DataFrame | None,
+    ranking_preds_df: pd.DataFrame | None,
+) -> None:
+    st.markdown("### Raw predictions")
+    if primary_preds is not None and {"y_true", "y_pred"}.issubset(primary_preds.columns):
+        t_df = (
+            primary_preds[primary_preds["Ticker"] == state.ticker_code]
+            .tail(200)
+            .sort_values("Date", ascending=False)
+        )
+        t_df = t_df.copy()
+        t_df["Direction_Correct"] = np.sign(t_df["y_true"]) == np.sign(t_df["y_pred"])
+        t_df["y_true_pct"] = (t_df["y_true"] * 100).round(4)
+        t_df["y_pred_pct"] = (t_df["y_pred"] * 100).round(4)
+        st.dataframe(
+            t_df[["Date", "y_true_pct", "y_pred_pct", "Direction_Correct"]].rename(
+                columns={
+                    "y_true_pct": "Actual %",
+                    "y_pred_pct": "Pred %",
+                    "Direction_Correct": "Dir match",
+                }
+            ),
+            use_container_width=True,
+            height=420,
+        )
+    elif ranking_preds_df is not None and not ranking_preds_df.empty:
+        t_df = ranking_preds_df[ranking_preds_df["Ticker"] == state.ticker_code].tail(200)
+        t_df = t_df.sort_values("Date", ascending=False)
+        if t_df.empty:
+            st.info("No rows for this ticker.")
+        else:
+            t_df = t_df.copy()
+            t_df["Direction_Correct"] = (
+                np.sign(t_df["actual_alpha"]) == np.sign(t_df["predicted_alpha"])
+            )
+            t_df["actual_pct"] = (t_df["actual_alpha"] * 100).round(4)
+            t_df["pred_pct"] = (t_df["predicted_alpha"] * 100).round(4)
+            st.dataframe(
+                t_df[["Date", "actual_pct", "pred_pct", "Direction_Correct"]].rename(
+                    columns={
+                        "actual_pct": "Actual %",
+                        "pred_pct": "Pred %",
+                        "Direction_Correct": "Dir match",
+                    }
+                ),
+                use_container_width=True,
+                height=420,
+            )
+    else:
+        st.info("No prediction CSV found under `results/`.")
+    st.caption("Tip: use the sidebar refresh if you regenerate results on disk.")
+
+
+# ─── Main ────────────────────────────────────────────────────
+def main() -> None:
+    data = load_data(str(ROOT))
+    ranking_df = data["ranking_df"]
+
+    state = render_sidebar(ranking_df)
+
+    nifty_prices = data.get("nifty_prices")
+
+    # Full-sample baseline (same test filter) for metric deltas
+    if ranking_df is not None and not ranking_df.empty:
+        r = ranking_df.copy()
+        r["Date"] = pd.to_datetime(r["Date"])
+        d_lo, d_hi = r["Date"].min(), r["Date"].max()
+    else:
+        d_lo = d_hi = state.date_end
+
+    full_slice = (
+        filter_ranking_by_dates(ranking_df, d_lo, d_hi, state.live_test_only)
+        if ranking_df is not None
+        else pd.DataFrame()
+    )
+    ranking_slice = filter_ranking_by_dates(
+        ranking_df, state.date_start, state.date_end, state.live_test_only
+    )
+
+    sim_window = (
+        simulate_portfolio(
+            ranking_df,
+            state.date_start,
+            state.date_end,
+            state.sim_top_n,
+            state.sim_capital,
+            state.live_test_only,
+            nifty_prices,
+        )
+        if ranking_df is not None
+        else None
+    )
+    sim_full = (
+        simulate_portfolio(
+            ranking_df,
+            d_lo,
+            d_hi,
+            state.sim_top_n,
+            state.sim_capital,
+            state.live_test_only,
+            nifty_prices,
+        )
+        if ranking_df is not None
+        else None
+    )
+
+    metrics_win = calculate_metrics(ranking_slice, sim_window)
+    metrics_full = calculate_metrics(full_slice, sim_full)
+
+    features_df = load_features(state.ticker_code)
+    regime_info = get_current_regime(features_df)
+    reg_series = data.get("regime_series")
+    shadow_regime = regime_at(reg_series, state.as_of_date)
+    shadow_df = (
+        top5_shadow_for_date(
+            ranking_df,
+            state.as_of_date,
+        )
+        if ranking_df is not None
+        else pd.DataFrame()
+    )
+
+    all_predictions = load_all_predictions()
+
+    st.markdown("# RAMT · simulation workbench")
+    st.caption("Interactive historical performance · JetBrains Mono · dark workspace")
+
+    tab_live, tab_train, tab_raw = st.tabs(["Live performance", "Training analytics", "Raw data explorer"])
+
+    with tab_live:
+        render_live_performance_tab(
+            data,
+            state,
+            ranking_df,
+            ranking_slice,
+            full_slice,
+            sim_window,
+            sim_full,
+            metrics_win,
+            metrics_full,
+            features_df,
+            regime_info,
+            shadow_df,
+            shadow_regime,
+        )
+
+    with tab_train:
+        render_training_analytics_tab(
+            state,
+            ranking_df,
+            ranking_slice,
+            all_predictions,
+            features_df,
+        )
+
+    with tab_raw:
+        render_raw_data_explorer_tab(
+            state,
+            load_predictions(state.selected_model.lower()),
+            ranking_df,
+        )
+
     st.markdown("---")
     st.markdown(
-        "<div style='text-align:center; color:#475569;'>"
-        "RAMT — Regime-Adaptive Multimodal Transformer | "
-        "Rishihood University | "
-        "Shivansh Gupta & Vivek Vishnoi | "
-        "⚠️ For research purposes only — not financial advice"
+        "<div style='text-align:center;color:#475569;font-size:12px;'>"
+        "RAMT — research only · not financial advice"
         "</div>",
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 if __name__ == "__main__":
     main()
-

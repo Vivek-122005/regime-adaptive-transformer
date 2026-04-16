@@ -1,17 +1,23 @@
 """
 Final split runner (no future leakage)
 
-Train: 2015-2023
-Test/backtest: 2024-2026 (until available data end)
+Train: 2015-01-01 … 2022-12-31 (history used to fit scalers + model).
+Blind test / backtest: 2023-01-01 … 2026-04-15 (held out from scaler fitting).
+
+Default rebalance step: 126 trading days (~6 months) to cut prediction rows vs monthly (21d).
 
 Produces:
 - results/ranking_predictions.csv
 - results/monthly_rankings.csv
 - results/backtest_results.csv
+- results/training_history.csv & results/training_dashboard.png (unless --no-plots)
+
+Use ``--backtest-only`` to skip training and reuse ``ranking_predictions.csv`` after a full run.
 """
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -28,7 +34,7 @@ from models.ramt import train_ranking as tr  # noqa: E402
 def add_momentum_column(rankings: pd.DataFrame) -> pd.DataFrame:
     """
     Attach a momentum score for dashboard display.
-    Uses RelMom_12_1 if present, else RelMom_252d, else 0.
+    For the NIFTY200 Parquet pipeline, we use Ret_21d if available (recent momentum proxy).
     """
     if rankings.empty:
         rankings["momentum"] = []
@@ -41,9 +47,10 @@ def add_momentum_column(rankings: pd.DataFrame) -> pd.DataFrame:
         d = pd.to_datetime(row["Date"])
         t = row["Ticker"]
         if t not in cache:
-            p = ROOT / "data/processed" / f"{t}_features.csv"
-            df = pd.read_csv(p, parse_dates=["Date"]).sort_values("Date")
-            df = df.set_index("Date")
+            p = ROOT / "data/processed" / f"{t}_features.parquet"
+            df = pd.read_parquet(p)
+            df["Date"] = pd.to_datetime(df["Date"])
+            df = df.sort_values("Date").set_index("Date")
             cache[t] = df
         df = cache[t]
         # last available on/before date
@@ -52,48 +59,111 @@ def add_momentum_column(rankings: pd.DataFrame) -> pd.DataFrame:
             moms.append(0.0)
             continue
         last = sub.iloc[-1]
-        if "RelMom_12_1" in last:
-            moms.append(float(last["RelMom_12_1"]))
-        elif "RelMom_252d" in last:
-            moms.append(float(last["RelMom_252d"]))
-        else:
-            moms.append(0.0)
+        moms.append(float(last["Ret_21d"]) if "Ret_21d" in last else 0.0)
 
     rankings = rankings.copy()
     rankings["momentum"] = moms
     return rankings
 
 
-def main():
-    os.makedirs("results", exist_ok=True)
+def main() -> None:
+    parser = argparse.ArgumentParser(description="RAMT blind-split final run (2023–2026 test)")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=3,
+        help="Training epochs for combined_walk_forward (default: 3)",
+    )
+    parser.add_argument(
+        "--step-size",
+        type=int,
+        default=126,
+        help="Rebalance interval in trading days: 126 ≈ 6 months; 21 ≈ monthly (default: 126)",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=None,
+        help="Override tr.BATCH_SIZE (default: keep train_ranking default)",
+    )
+    parser.add_argument(
+        "--patience",
+        type=int,
+        default=None,
+        help="Early-stopping patience on val loss (default: train_ranking.PATIENCE)",
+    )
+    parser.add_argument(
+        "--no-plots",
+        action="store_true",
+        help="Disable matplotlib dashboard + training_history.csv export",
+    )
+    parser.add_argument(
+        "--backtest-only",
+        action="store_true",
+        help="Skip training; load predictions CSV and run rankings + backtest only",
+    )
+    parser.add_argument(
+        "--predictions",
+        type=str,
+        default=None,
+        help="Path to ranking_predictions.csv for --backtest-only (default: results/ranking_predictions.csv)",
+    )
+    args = parser.parse_args()
 
-    # Strict split
+    os.makedirs(ROOT / "results", exist_ok=True)
+
+    # Strict blind split (matches train_ranking.py)
     train_start = "2015-01-01"
-    train_end = "2023-12-31"
-    test_start = "2024-01-01"
-    test_end = "2026-01-01"
+    train_end = "2022-12-31"
+    test_start = "2023-01-01"
+    test_end = "2026-04-15"
 
-    # Training hyperparams (adjust up for a true final run)
-    tr.MAX_EPOCHS = 10
-    tr.PATIENCE = 3
-    tr.BATCH_SIZE = 128
-
-    print("Training fixed combined model (no leakage) and predicting test period...", flush=True)
-    preds = tr.train_fixed_and_predict(
-        train_start=train_start,
-        train_end=train_end,
-        test_start=test_start,
-        test_end=test_end,
-        step_size=21,
-        max_epochs=tr.MAX_EPOCHS,
+    preds_path = (
+        Path(args.predictions)
+        if args.predictions
+        else ROOT / "results" / "ranking_predictions.csv"
     )
 
-    preds_out = ROOT / "results/ranking_predictions.csv"
-    preds.to_csv(preds_out, index=False)
-    print(f"Saved: {preds_out}", flush=True)
+    if args.backtest_only:
+        if not preds_path.is_file():
+            raise SystemExit(f"--backtest-only: predictions file not found: {preds_path.resolve()}")
+        print(f"Loading predictions (no training): {preds_path.resolve()}", flush=True)
+        print(
+            f"Using step_size={args.step_size} for backtest calendar — match the step used when "
+            f"ranking_predictions.csv was generated.",
+            flush=True,
+        )
+        preds = pd.read_csv(preds_path)
+        preds["Date"] = pd.to_datetime(preds["Date"])
+        required = {"Date", "Ticker", "predicted_alpha", "actual_alpha", "Period"}
+        missing = required - set(preds.columns)
+        if missing:
+            raise SystemExit(f"Predictions CSV missing columns {missing}; need {required}")
+    else:
+        tr.PATIENCE = args.patience if args.patience is not None else tr.PATIENCE
+        if args.batch_size is not None:
+            tr.BATCH_SIZE = int(args.batch_size)
+
+        plot_dir = None if args.no_plots else str(ROOT / "results")
+
+        print(
+            f"Training blind-split combined model (epochs={args.epochs}, step_size={args.step_size})…",
+            flush=True,
+        )
+        preds = tr.combined_walk_forward(
+            start=train_start,
+            end=test_end,
+            step_size=int(args.step_size),
+            max_epochs=int(args.epochs),
+            plot_dir=plot_dir,
+        )
+
+        preds_out = ROOT / "results/ranking_predictions.csv"
+        preds.to_csv(preds_out, index=False)
+        print(f"Saved: {preds_out}", flush=True)
 
     rankings = preds.rename(columns={"predicted_alpha": "score"})[
-        ["Date", "Ticker", "score", "actual_alpha", "fold_train_end"]
+        ["Date", "Ticker", "score", "actual_alpha", "Period"]
     ]
     rankings = add_momentum_column(rankings)
     rankings_out = ROOT / "results/monthly_rankings.csv"
@@ -102,17 +172,20 @@ def main():
 
     print("Running daily-price backtest with risk rules...", flush=True)
     bt = run_backtest_daily(
-        predictions_df=preds[["Date", "Ticker", "predicted_alpha", "actual_alpha"]],
-        nifty_features_path=str(ROOT / "data/processed/NIFTY50_features.csv"),
+        predictions_df=preds[preds["Period"] == "Test"][["Date", "Ticker", "predicted_alpha", "actual_alpha"]],
+        nifty_features_path=str(ROOT / "data/processed/_NSEI_features.parquet"),
         raw_dir=str(ROOT / "data/raw"),
         start=test_start,
         end=test_end,
-        step_size=21,
+        step_size=int(args.step_size),
         top_n=5,
         capital=100000,
         stop_loss=0.07,
         max_weight=0.20,
         portfolio_dd_cash_trigger=0.15,
+        trade_cost_bps=15.0,
+        slippage_bps=10.0,
+        turnover_penalty_score=0.0,
     )
     bt_out = ROOT / "results/backtest_results.csv"
     bt.to_csv(bt_out, index=False)
@@ -124,4 +197,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

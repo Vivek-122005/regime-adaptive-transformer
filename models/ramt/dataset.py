@@ -1,11 +1,42 @@
 import os
+from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
+from sklearn.preprocessing import RobustScaler
 from torch.utils.data import DataLoader, Dataset
-from sklearn.preprocessing import StandardScaler
+
+# -----------------------------------------------------------------------------
+# Lean NIFTY 200 Parquet feature schema (model inputs only — no regime in X)
+# -----------------------------------------------------------------------------
+
+MACRO_COLS = [
+    "Macro_INDIAVIX_Ret1d_L1",
+    "Macro_CRUDE_Ret1d_L1",
+    "Macro_USDINR_Ret1d_L1",
+    "Macro_SP500_Ret1d_L1",
+]
+
+# Encoder grouping (must partition ALL_FEATURE_COLS without overlap; sum = len(ALL_FEATURE_COLS))
+PRICE_COLS = ["Ret_1d", "Ret_5d", "Ret_21d"]
+TECH_COLS = ["RSI_14", "BB_Dist"]
+VOLUME_COLS = ["Volume_Surge"]
+# Legacy names kept empty for imports; regime is NOT in X (passed separately to the model)
+VOL_COLS: list[str] = []
+MOMENTUM_COLS: list[str] = []
+CROSS_ASSET_COLS: list[str] = []
+REGIME_COLS: list[str] = []
+
+ALL_FEATURE_COLS = PRICE_COLS + TECH_COLS + VOLUME_COLS + MACRO_COLS
+
+# Separate gate input for the transformer (not part of scaled feature vector)
+HMM_REGIME_COL = "HMM_Regime"
+
+TARGET_COL = "Monthly_Alpha"
+
 
 def _ticker_from_processed_filename(name: str) -> str:
     stem = Path(name).stem
@@ -24,9 +55,9 @@ def build_ticker_universe(processed_dir: str = "data/processed") -> list[str]:
     if not pdir.exists():
         return []
 
-    exclude = {"NIFTY50", "SP500", "JPM"}
+    exclude = {"NIFTY50", "SP500", "JPM", "NSEI"}
     tickers: list[str] = []
-    for p in sorted(pdir.glob("*_features.csv")):
+    for p in sorted(list(pdir.glob("*_features.parquet"))):
         t = _ticker_from_processed_filename(p.name)
         if t in exclude:
             continue
@@ -35,81 +66,59 @@ def build_ticker_universe(processed_dir: str = "data/processed") -> list[str]:
 
 
 # Stable ticker universe for embeddings / cross-stock training.
-# If processed files exist, derive it from disk; else fall back to a minimal list.
 TICKER_LIST = build_ticker_universe() or ["TCS_NS"]
 TICKER_TO_ID = {t: i for i, t in enumerate(TICKER_LIST)}
 
-PRICE_COLS = [
-    "Return_Lag_1",
-    "Return_Lag_2",
-    "Return_Lag_3",
-    "Return_Lag_5",
-    "Return_Lag_10",
-    "Return_Lag_20",
-]
 
-VOL_COLS = [
-    "Realized_Vol_5",
-    "Realized_Vol_20",
-    "Realized_Vol_60",
-    "Garman_Klass_Vol",
-    "Vol_Ratio",
-]
+def _regime_fallback_from_ret1d(ret1d: pd.Series) -> np.ndarray:
+    """
+    If HMM_Regime is missing, approximate a 3-way regime from trailing volatility of Ret_1d.
+    Maps to {0,1,2} compatible with the model's regime embedding.
+    """
+    rv = ret1d.astype(float).rolling(20, min_periods=5).std()
+    rv = rv.bfill().ffill()
+    if rv.isna().all():
+        return np.ones(len(ret1d), dtype=np.int64)
+    try:
+        # Terciles: low vol ~ bull(1), mid ~ high_vol(0), high vol ~ bear(2) — order by vol ascending
+        q = pd.qcut(rv, q=3, labels=[1, 0, 2], duplicates="drop")
+        out = pd.to_numeric(q, errors="coerce").fillna(1.0).astype(np.int64).values
+        return out
+    except Exception:
+        med = float(rv.median())
+        hi = rv > med * 1.25
+        lo = rv < med * 0.75
+        out = np.where(hi, 2, np.where(lo, 1, 0)).astype(np.int64)
+        return out
 
-TECH_COLS = [
-    "RSI_14",
-    "MACD",
-    "MACD_Signal",
-    "MACD_Hist",
-    "BB_Upper",
-    "BB_Lower",
-    "BB_Width",
-    "BB_Position",
-]
 
-MOMENTUM_COLS = ["Momentum_5", "Momentum_20", "Momentum_60", "ROC_10"]
+def ensure_hmm_regime_array(df: pd.DataFrame) -> np.ndarray:
+    """
+    Return int64 regime per row. Prefer column HMM_Regime when present and valid;
+    otherwise compute on-the-fly from Ret_1d.
+    """
+    n = len(df)
+    if HMM_REGIME_COL in df.columns and df[HMM_REGIME_COL].notna().any():
+        s = df[HMM_REGIME_COL].astype(float)
+        if s.notna().all():
+            return np.clip(s.round().astype(np.int64), 0, 2)
+        filled = s.fillna(1.0)
+        return np.clip(filled.round().astype(np.int64), 0, 2)
 
-VOLUME_COLS = ["Volume_MA_Ratio", "Volume_Log"]
+    if "Ret_1d" not in df.columns:
+        return np.ones(n, dtype=np.int64)
+    return _regime_fallback_from_ret1d(df["Ret_1d"])
 
-REGIME_COLS = ["HMM_Regime"]
 
-CROSS_ASSET_COLS = ["Rolling_Corr_Index"]
+def clip_target(y, lo: float = -0.2, hi: float = 0.2):
+    """
+    Clip extreme label values to reduce damage from bad data (splits, spikes).
+    Monthly alpha outside ±20% is treated as suspicious for this project and capped.
+    """
+    import numpy as _np
 
-RELATIVE_MOM_COLS = [
-    "RelMom_5d",
-    "RelMom_21d",
-    "RelMom_63d",
-    "RelMom_126d",
-    "RelMom_252d",
-    "Mom_12_1",
-    "RelMom_12_1",
-]
-
-MACRO_COLS = [
-    "Macro_USDINR_Ret1d",
-    "Macro_USDINR_Ret5d",
-    "Macro_CRUDE_Ret1d",
-    "Macro_CRUDE_Ret5d",
-    "Macro_GOLD_Ret1d",
-    "Macro_GOLD_Ret5d",
-    "Macro_USVIX_Ret1d",
-    "Macro_USVIX_Ret5d",
-]
-
-ALL_FEATURE_COLS = (
-    PRICE_COLS
-    + VOL_COLS
-    + TECH_COLS
-    + MOMENTUM_COLS
-    + VOLUME_COLS
-    + REGIME_COLS
-    + CROSS_ASSET_COLS
-    + RELATIVE_MOM_COLS
-    + MACRO_COLS
-)
-# Total: 42 columns
-
-TARGET_COL = "Monthly_Alpha"  # was "Log_Return"
+    arr = _np.asarray(y, dtype=_np.float32)
+    return _np.clip(arr, lo, hi)
 
 
 class SequenceDataset(Dataset):
@@ -117,7 +126,7 @@ class SequenceDataset(Dataset):
     Creates overlapping sequences of length seq_len from
     a numpy feature array. Each sample is:
       X: (seq_len, num_features) — input sequence
-      y: scalar — next day log return (target)
+      y: scalar — target
       regime: integer — HMM_Regime at last timestep
     """
 
@@ -127,7 +136,6 @@ class SequenceDataset(Dataset):
         self.regimes = regimes  # numpy (N,) integers
         self.seq_len = seq_len
         self.ticker_id = ticker_id
-        # Valid indices: need seq_len rows before each target
         self.valid_idx = list(range(seq_len, len(targets)))
 
     def __len__(self):
@@ -135,9 +143,9 @@ class SequenceDataset(Dataset):
 
     def __getitem__(self, idx):
         i = self.valid_idx[idx]
-        X = self.features[i - self.seq_len : i]  # (seq_len, features)
-        y = self.targets[i]  # scalar
-        regime = self.regimes[i]  # integer
+        X = self.features[i - self.seq_len : i]
+        y = self.targets[i]
+        regime = self.regimes[i]
         batch = (
             torch.FloatTensor(X),
             torch.FloatTensor([y]),
@@ -148,13 +156,12 @@ class SequenceDataset(Dataset):
         return batch + (torch.LongTensor([int(self.ticker_id)]),)
 
 
-class RAMTDataModule:
+class RAMTDataset:
     """
-    Handles data loading, scaling, and DataLoader creation
-    for one ticker and one walk-forward fold.
+    Loads one ticker's processed Parquet features, applies RobustScaler fit on train only
+    via get_fold_loaders. Primary target: Monthly_Alpha.
 
-    Key guarantee: StandardScaler is ALWAYS fit on training
-    data only and applied to val/test. Zero leakage.
+    Key guarantee: RobustScaler is fit on training data only — zero leakage.
     """
 
     def __init__(
@@ -167,61 +174,46 @@ class RAMTDataModule:
         self.ticker = ticker
         self.seq_len = seq_len
         self.batch_size = batch_size
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
         self.df = None
         self.features = None
         self.targets = None
         self.regimes = None
-        self.ticker_id = None  # set externally
+        self.ticker_id = None
         self._load_data(data_dir)
 
     def _load_data(self, data_dir):
-        """Load CSV, compute target, extract feature arrays."""
-        path = os.path.join(data_dir, f"{self.ticker}_features.csv")
-        df = pd.read_csv(path, parse_dates=["Date"])
-        df = df.sort_values("Date").reset_index(drop=True)
-        df = df.set_index("Date", drop=True)
+        """Load Parquet; RobustScaler features = ALL_FEATURE_COLS only; regime separate."""
+        path = os.path.join(data_dir, f"{self.ticker}_features.parquet")
+        df = pd.read_parquet(path)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").reset_index(drop=True).set_index("Date", drop=True)
 
-        # Target: Monthly_Alpha already encodes forward 21d alpha
-        df["target"] = df[TARGET_COL]
-        df = df.dropna(subset=["target"])
-
-        # Verify all feature columns exist
         missing = [c for c in ALL_FEATURE_COLS if c not in df.columns]
         if missing:
-            raise ValueError(f"Missing columns for {self.ticker}: {missing}")
+            raise ValueError(f"Missing feature columns for {self.ticker}: {missing}")
+
+        if TARGET_COL not in df.columns:
+            raise ValueError(f"Missing target {TARGET_COL} for {self.ticker}")
+
+        df = df.dropna(subset=[TARGET_COL])
+        # Daily_Return optional for single-ticker loaders; multi-ticker training sets it
+        if "Daily_Return" in df.columns:
+            df = df.dropna(subset=["Daily_Return"])
+
+        regime_arr = ensure_hmm_regime_array(df.reset_index())
 
         self.df = df
         self.dates = df.index.values
-        self.features_raw = df[ALL_FEATURE_COLS].values.astype(np.float32)
-        self.targets = df["target"].values.astype(np.float32)
-        self.regimes = df["HMM_Regime"].values.astype(np.int64)
+        self.features_raw = df[list(ALL_FEATURE_COLS)].values.astype(np.float32)
+        self.targets = df[TARGET_COL].values.astype(np.float32)
+        self.regimes = regime_arr.astype(np.int64)
 
     def get_fold_loaders(self, train_idx, test_idx, val_fraction=0.15):
-        """
-        Create DataLoaders for one walk-forward fold.
-
-        Steps:
-        1. Split train_idx into train and val
-        2. Fit scaler on training features only
-        3. Transform train, val, test
-        4. Create SequenceDatasets
-        5. Return DataLoaders
-
-        Args:
-            train_idx: array of training row indices
-            test_idx: array of test row indices
-            val_fraction: fraction of training for validation
-
-        Returns:
-            train_loader, val_loader, test_loader, test_dates
-        """
-        # Split train into train and val
         val_size = max(1, int(len(train_idx) * val_fraction))
         actual_train_idx = train_idx[:-val_size]
         val_idx = train_idx[-val_size:]
 
-        # Extract raw features
         X_train = self.features_raw[actual_train_idx]
         X_val = self.features_raw[val_idx]
         X_test = self.features_raw[test_idx]
@@ -234,13 +226,11 @@ class RAMTDataModule:
         r_val = self.regimes[val_idx]
         r_test = self.regimes[test_idx]
 
-        # Fit scaler on training only
-        self.scaler = StandardScaler()
+        self.scaler = RobustScaler()
         X_train_sc = self.scaler.fit_transform(X_train)
         X_val_sc = self.scaler.transform(X_val)
         X_test_sc = self.scaler.transform(X_test)
 
-        # Create datasets
         train_ds = SequenceDataset(
             X_train_sc, y_train, r_train, self.seq_len, ticker_id=self.ticker_id
         )
@@ -249,7 +239,6 @@ class RAMTDataModule:
             X_test_sc, y_test, r_test, self.seq_len, ticker_id=self.ticker_id
         )
 
-        # DataLoaders
         train_loader = DataLoader(
             train_ds,
             batch_size=self.batch_size,
@@ -274,10 +263,6 @@ class RAMTDataModule:
         return train_loader, val_loader, test_loader, test_dates
 
     def get_walk_forward_indices(self, init_train_frac=0.6, step_size=63):
-        """
-        Generate walk-forward fold indices.
-        Returns list of (train_idx, test_idx) tuples.
-        """
         n = len(self.targets)
         init_train_size = int(n * init_train_frac)
         folds = []
@@ -292,31 +277,143 @@ class RAMTDataModule:
         return folds
 
 
-if __name__ == "__main__":
-    print("Testing RAMTDataModule...")
+# Backward-compatible name used in model.py / encoder.py
+RAMTDataModule = RAMTDataset
 
-    dm = RAMTDataModule("JPM", seq_len=30, batch_size=32)
+
+class LazyTickerStore:
+    """
+    LRU-cached ticker parquet reader. Scaled feature matrix uses ALL_FEATURE_COLS only.
+    Regime is separate (HMM_Regime or fallback).
+    """
+
+    def __init__(self, processed_dir: str = "data/processed", cache_size: int = 6):
+        self.processed_dir = Path(processed_dir)
+        self.cache_size = int(cache_size)
+        self._cache: OrderedDict[str, dict[str, object]] = OrderedDict()
+
+    def _load_ticker_df(self, ticker: str) -> pd.DataFrame:
+        path = self.processed_dir / f"{ticker}_features.parquet"
+        df = pd.read_parquet(path)
+        df["Date"] = pd.to_datetime(df["Date"])
+        df = df.sort_values("Date").reset_index(drop=True)
+        return df
+
+    def get(self, ticker: str) -> dict[str, object]:
+        if ticker in self._cache:
+            self._cache.move_to_end(ticker)
+            return self._cache[ticker]
+
+        df = self._load_ticker_df(ticker)
+        missing = [c for c in ALL_FEATURE_COLS if c not in df.columns]
+        if missing:
+            raise ValueError(f"{ticker}: missing feature columns: {missing}")
+        if TARGET_COL not in df.columns:
+            raise ValueError(f"{ticker}: missing {TARGET_COL}")
+
+        # Legacy / partial Parquet may omit Daily_Return; match features/feature_engineering.add_daily_target
+        if "Daily_Return" not in df.columns:
+            if "Ret_1d" not in df.columns:
+                raise ValueError(f"{ticker}: need Daily_Return or Ret_1d to build tactical target")
+            df = df.copy()
+            df["Daily_Return"] = df["Ret_1d"].shift(-1)
+
+        df = df.dropna(subset=[TARGET_COL, "Daily_Return"])
+
+        dates = pd.DatetimeIndex(df["Date"])
+        X = df[list(ALL_FEATURE_COLS)].values.astype(np.float32)
+        y_m = df[TARGET_COL].values.astype(np.float32)
+        y_d = df["Daily_Return"].values.astype(np.float32)
+        r = ensure_hmm_regime_array(df)
+
+        item = {"dates": dates, "X": X, "y_m": y_m, "y_d": y_d, "r": r}
+        self._cache[ticker] = item
+        self._cache.move_to_end(ticker)
+        while len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+        return item
+
+
+class LazyMultiTickerSequenceDataset(Dataset):
+    """
+    Sequence dataset backed by per-ticker Parquet files, loaded on demand.
+    sample_keys: list of (ticker, index) where index refers to row position within that ticker.
+
+    When ``feature_scaler`` / ``y_scaler`` are provided (fitted on training data only),
+    each sample applies ``.transform()`` to the raw Parquet window so train/val/test
+    match inference (Systems-First scaling bridge).
+    """
+
+    def __init__(
+        self,
+        store: LazyTickerStore,
+        sample_keys: list[tuple[str, int]],
+        seq_len: int = 30,
+        feature_scaler: RobustScaler | None = None,
+        y_scaler: RobustScaler | None = None,
+        y_winsor_lo: float | None = None,
+        y_winsor_hi: float | None = None,
+    ):
+        self.store = store
+        self.sample_keys = sample_keys
+        self.seq_len = int(seq_len)
+        self.feature_scaler = feature_scaler
+        self.y_scaler = y_scaler
+        self.y_winsor_lo = y_winsor_lo
+        self.y_winsor_hi = y_winsor_hi
+
+    def __len__(self):
+        return len(self.sample_keys)
+
+    def __getitem__(self, idx):
+        ticker, i = self.sample_keys[idx]
+        td = self.store.get(ticker)
+        X_raw = td["X"][i - self.seq_len : i]
+        if self.feature_scaler is not None:
+            X = self.feature_scaler.transform(X_raw.astype(np.float64, copy=False)).astype(
+                np.float32
+            )
+        else:
+            X = np.asarray(X_raw, dtype=np.float32)
+
+        y_m_raw = float(td["y_m"][i])
+        if self.y_winsor_lo is not None and self.y_winsor_hi is not None:
+            y_m_raw = float(np.clip(y_m_raw, self.y_winsor_lo, self.y_winsor_hi))
+        if self.y_scaler is not None:
+            y_m = float(self.y_scaler.transform(np.array([[y_m_raw]], dtype=np.float64))[0, 0])
+        else:
+            y_m = y_m_raw
+
+        y_d = float(td["y_d"][i])
+        r = int(td["r"][i])
+        d = int(td["dates"][i].value)
+        tid = int(TICKER_TO_ID.get(ticker, 0))
+        return (
+            torch.from_numpy(X),
+            torch.tensor([y_m], dtype=torch.float32),
+            torch.tensor([y_d], dtype=torch.float32),
+            torch.tensor([r], dtype=torch.long),
+            torch.tensor([tid], dtype=torch.long),
+            torch.tensor([d], dtype=torch.long),
+        )
+
+
+if __name__ == "__main__":
+    print("Testing RAMTDataset...")
+
+    dm = RAMTDataset("TCS_NS", seq_len=30, batch_size=32)
     folds = dm.get_walk_forward_indices()
 
     print(f"Total folds: {len(folds)}")
     print(f"Total rows: {len(dm.targets)}")
-    print(f"Feature columns: {len(ALL_FEATURE_COLS)}")
-    print(f"Feature names: {ALL_FEATURE_COLS}")
+    print(f"Feature columns ({len(ALL_FEATURE_COLS)}): {ALL_FEATURE_COLS}")
 
-    # Test first fold
     train_idx, test_idx = folds[0]
-    train_loader, val_loader, test_loader, dates = dm.get_fold_loaders(
-        train_idx, test_idx
-    )
+    train_loader, val_loader, test_loader, dates = dm.get_fold_loaders(train_idx, test_idx)
 
-    # Check shapes
     X_batch, y_batch, r_batch = next(iter(train_loader))
     print("\nFirst fold:")
-    print(f"  Train size: {len(train_idx)}")
-    print(f"  Test size: {len(test_idx)}")
     print(f"  X shape: {X_batch.shape}")
     print(f"  y shape: {y_batch.shape}")
     print(f"  regime shape: {r_batch.shape}")
-    print(f"  Regime values: {r_batch.squeeze().unique()}")
-    print(f"  X min: {X_batch.min():.4f} max: {X_batch.max():.4f}")
     print("\nAll checks passed.")

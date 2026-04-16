@@ -13,6 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import yfinance as yf
+import time
 
 # -----------------------------------------------------------------------------
 # Configuration
@@ -85,6 +86,27 @@ NIFTY_50_TICKERS: list[str] = [
     "^NSEI",  # NIFTY 50 index
 ]
 
+# NIFTY 200 universe
+# To avoid hardcoding 200 symbols in code, we load from `data/nifty200_tickers.txt`.
+# File format: one Yahoo ticker per line (e.g. RELIANCE.NS). Comments allowed with '#'.
+NIFTY_200_TICKERS_FILE = Path(__file__).resolve().parent / "nifty200_tickers.txt"
+
+
+def load_tickers_from_file(path: Path) -> list[str]:
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Missing ticker universe file: {path}\n"
+            "Create it with one Yahoo ticker per line (e.g., RELIANCE.NS)."
+        )
+    out: list[str] = []
+    for line in path.read_text().splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
+            continue
+        out.append(s)
+    return out
+
+
 # Macro series (saved as data/raw/macro_{NAME}_raw.csv)
 MACRO_TICKERS: dict[str, str] = {
     "USDINR": "USDINR=X",
@@ -96,7 +118,7 @@ MACRO_TICKERS: dict[str, str] = {
 START_DATE = "2015-01-01"
 END_DATE = "2026-01-01"
 
-TICKERS: list[str] = NIFTY_50_TICKERS
+TICKERS: list[str] = load_tickers_from_file(NIFTY_200_TICKERS_FILE)
 TICKER_DATE_OVERRIDES: dict[str, tuple[str, str]] = {}
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 OHLCV_COLS = ["Open", "High", "Low", "Close", "Volume"]
@@ -182,15 +204,42 @@ def download_one_ticker(ticker: str, start: str, end: str) -> pd.DataFrame:
     pd.DataFrame
         Columns include Date, OHLCV, Log_Return, Ticker; empty if download failed.
     """
-    raw = yf.download(
-        ticker,
-        start=start,
-        end=end,
-        interval="1d",
-        auto_adjust=True,
-        progress=False,
-    )
+    # yfinance can occasionally return empty data due to transient Yahoo throttling
+    # or cookie/crumb issues. Use a small retry loop and fall back to Ticker.history.
+    raw = pd.DataFrame()
+    last_err: Exception | None = None
+    for attempt in range(3):
+        try:
+            raw = yf.download(
+                ticker,
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+                threads=False,
+                progress=False,
+            )
+            if not raw.empty:
+                break
+            # fallback path
+            raw = yf.Ticker(ticker).history(
+                start=start,
+                end=end,
+                interval="1d",
+                auto_adjust=True,
+                actions=False,
+            )
+            if not raw.empty:
+                break
+        except Exception as e:
+            last_err = e
+        # exponential-ish backoff
+        time.sleep(1.0 + attempt * 2.0)
+
     if raw.empty:
+        if last_err is not None:
+            print(f"  [WARN] download failed for {ticker}: {last_err}")
         return pd.DataFrame()
 
     df = flatten_yfinance_columns(raw)

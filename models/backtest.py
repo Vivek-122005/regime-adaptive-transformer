@@ -20,13 +20,86 @@ Metrics to report:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
 
 
+def _load_nifty_benchmark_raw(raw_dir: str | Path) -> pd.DataFrame:
+    """
+    Load NIFTY benchmark OHLCV from Parquet (preferred) or legacy `_NSEI_raw.csv`.
+
+    Ensures `Adj Close` exists for downstream feature helpers.
+    """
+    rdir = Path(raw_dir)
+    pq = rdir / "_NSEI.parquet"
+    csv = rdir / "_NSEI_raw.csv"
+    if pq.exists():
+        df = pd.read_parquet(pq)
+    elif csv.exists():
+        df = pd.read_csv(csv)
+        df["Date"] = pd.to_datetime(df["Date"])
+        if "Adj Close" not in df.columns:
+            df["Adj Close"] = df["Close"].astype(float)
+        for col in ("Open", "High", "Low", "Close"):
+            if col not in df.columns:
+                df[col] = df["Adj Close"]
+        if "Volume" not in df.columns:
+            df["Volume"] = 1.0
+    else:
+        raise FileNotFoundError(
+            f"NIFTY benchmark not found: expected {pq} or {csv}"
+        )
+    df["Date"] = pd.to_datetime(df["Date"])
+    return df.sort_values("Date").reset_index(drop=True)
+
+
+def ensure_nifty_features_parquet(processed_dir: str | Path, raw_dir: str | Path) -> str:
+    """
+    Return path to ``_NSEI_features.parquet``, building it if missing.
+
+    The bulk ``feature_engineering`` loop excludes the index; the backtest still
+    needs ``HMM_Regime`` aligned to NIFTY dates.
+    """
+    pdir = Path(processed_dir)
+    rdir = Path(raw_dir)
+    out = pdir / "_NSEI_features.parquet"
+    if out.exists():
+        return str(out)
+
+    pdir.mkdir(parents=True, exist_ok=True)
+    df = _load_nifty_benchmark_raw(rdir)
+
+    from features.feature_engineering import (
+        add_hmm_regime_full_history,
+        add_realized_vol_20,
+        add_returns_features,
+    )
+
+    df = add_returns_features(df)
+    df = add_realized_vol_20(df)
+    df = add_hmm_regime_full_history(df)
+    slim = df[["Date", "HMM_Regime"]].dropna(subset=["HMM_Regime"])
+    slim.to_parquet(out, index=False)
+    return str(out)
+
+
+def resolve_nifty_features_path(nifty_features_path: str, raw_dir: str) -> str:
+    """Use existing processed Parquet if present; otherwise build from raw NIFTY."""
+    p = Path(nifty_features_path)
+    if p.exists():
+        return str(p.resolve())
+    processed_dir = Path(raw_dir).resolve().parent / "processed"
+    return ensure_nifty_features_parquet(processed_dir, raw_dir)
+
+
 def _load_price_series(raw_path: str) -> pd.Series:
-    df = pd.read_csv(raw_path, parse_dates=["Date"]).sort_values("Date")
-    s = df.set_index("Date")["Close"].astype(float)
+    p = pd.read_parquet(raw_path)
+    p["Date"] = pd.to_datetime(p["Date"])
+    p = p.sort_values("Date")
+    # Use Adj Close for integrity under splits/bonuses
+    s = p.set_index("Date")["Adj Close"].astype(float)
     return s
 
 
@@ -38,8 +111,9 @@ def build_rebalance_regime_df(
     Build regime series aligned to explicit rebalance dates.
     If exact date is missing in features, use last available previous value.
     """
-    f = pd.read_csv(nifty_features_path, parse_dates=["Date"]).sort_values("Date")
-    f = f.set_index("Date")["HMM_Regime"].astype(float).ffill()
+    f = pd.read_parquet(nifty_features_path)
+    f["Date"] = pd.to_datetime(f["Date"])
+    f = f.sort_values("Date").set_index("Date")["HMM_Regime"].astype(float).ffill()
     out = []
     for d in rebalance_dates:
         # take last available on/before date
@@ -61,7 +135,9 @@ def build_monthly_regime_df(
     Returns DataFrame with columns: Date, regime
     where Date is month start (first trading day present in that month).
     """
-    df = pd.read_csv(nifty_features_path, parse_dates=["Date"]).sort_values("Date")
+    df = pd.read_parquet(nifty_features_path)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date")
     df = df[(df["Date"] >= pd.to_datetime(start)) & (df["Date"] <= pd.to_datetime(end))]
     if df.empty or "HMM_Regime" not in df.columns:
         return pd.DataFrame(columns=["Date", "regime"])
@@ -84,16 +160,17 @@ def compute_nifty_monthly_returns(
     Returns DataFrame: date, nifty_return
     where date is month start (first trading day present in that month).
     """
-    df = pd.read_csv(nifty_raw_path, parse_dates=["Date"]).sort_values("Date").reset_index(drop=True)
+    df = pd.read_parquet(nifty_raw_path)
+    df["Date"] = pd.to_datetime(df["Date"])
+    df = df.sort_values("Date").reset_index(drop=True)
     df = df[(df["Date"] >= pd.to_datetime(start)) & (df["Date"] <= pd.to_datetime(end))]
     if df.empty:
         return pd.DataFrame(columns=["date", "nifty_return"])
 
-    if "Log_Return" not in df.columns:
-        # compute if missing
-        df["Log_Return"] = np.log(df["Close"] / df["Close"].shift(1))
-
-    df["fwd_21"] = df["Log_Return"].rolling(21).sum().shift(-21)
+    px = df["Adj Close"].astype(float).replace(0.0, np.nan)
+    r1 = px / px.shift(1)
+    lr = np.log(r1.where(r1 > 0.0))
+    df["fwd_21"] = lr.rolling(21).sum().shift(-21)
     df["Month"] = df["Date"].dt.to_period("M")
     ms = df.groupby("Month", as_index=False).head(1)
     out = ms[["Date", "fwd_21"]].rename(columns={"Date": "date", "fwd_21": "nifty_return"})
@@ -219,6 +296,9 @@ def run_backtest_daily(
     stop_loss: float = 0.07,
     max_weight: float = 0.20,
     portfolio_dd_cash_trigger: float = 0.15,
+    trade_cost_bps: float = 15.0,
+    slippage_bps: float = 10.0,
+    turnover_penalty_score: float = 0.0,
 ) -> pd.DataFrame:
     """
     Daily-price backtest with risk rules.
@@ -236,7 +316,9 @@ def run_backtest_daily(
     start_ts = pd.to_datetime(start)
     end_ts = pd.to_datetime(end)
 
-    nifty_raw = pd.read_csv(f"{raw_dir}/_NSEI_raw.csv", parse_dates=["Date"]).sort_values("Date")
+    nifty_features_path = resolve_nifty_features_path(nifty_features_path, raw_dir)
+
+    nifty_raw = _load_nifty_benchmark_raw(raw_dir)
     cal = pd.DatetimeIndex(nifty_raw["Date"])
     cal = cal[(cal >= start_ts) & (cal <= end_ts)]
     rebal = cal[::step_size]
@@ -252,13 +334,14 @@ def run_backtest_daily(
     def get_prices(ticker: str) -> pd.Series:
         if ticker in price_cache:
             return price_cache[ticker]
-        path = f"{raw_dir}/{ticker}_raw.csv"
+        path = f"{raw_dir}/{ticker}.parquet"
         price_cache[ticker] = _load_price_series(path)
         return price_cache[ticker]
 
     forced_cash_next = False
     results: list[dict[str, object]] = []
     pv = float(capital)
+    prev_holdings: set[str] = set()
 
     for i in range(len(rebal) - 1):
         d0 = pd.Timestamp(rebal[i])
@@ -289,7 +372,30 @@ def run_backtest_daily(
             position_size = 1.0
             n_sel = top_n
 
-        month_preds = preds[preds["Date"] == d0].nlargest(n_sel, "predicted_alpha")
+        month_df = preds[preds["Date"] == d0].copy()
+        if month_df.empty:
+            results.append(
+                {
+                    "date": d0,
+                    "portfolio_return": 0.0,
+                    "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
+                    "stocks_held": [],
+                    "cash": True,
+                    "portfolio_value": pv,
+                }
+            )
+            prev_holdings = set()
+            continue
+
+        # Optional turnover-aware selection: penalize NEW names slightly so we don't churn
+        if turnover_penalty_score > 0 and prev_holdings:
+            month_df["score_adj"] = month_df["predicted_alpha"]
+            month_df.loc[~month_df["Ticker"].isin(prev_holdings), "score_adj"] = (
+                month_df.loc[~month_df["Ticker"].isin(prev_holdings), "score_adj"] - turnover_penalty_score
+            )
+            month_preds = month_df.nlargest(n_sel, "score_adj")
+        else:
+            month_preds = month_df.nlargest(n_sel, "predicted_alpha")
         if month_preds.empty:
             results.append(
                 {
@@ -310,6 +416,22 @@ def run_backtest_daily(
         invested *= position_size
         cash_weight = 1.0 - invested
 
+        # Turnover and friction costs (approx):
+        # - turnover = fraction of invested basket that changes
+        # - cost applied on notional traded (entry/exit) at rebalance
+        new_holdings = set(tickers)
+        if not prev_holdings:
+            turnover = invested  # entering positions from cash
+        else:
+            # approximate: changed names / current names
+            changed = len(new_holdings.symmetric_difference(prev_holdings))
+            denom = max(1, len(new_holdings.union(prev_holdings)))
+            turnover = invested * (changed / denom)
+
+        # total bps cost on traded notional (STT+fees+slippage proxy)
+        total_cost_rate = (trade_cost_bps + slippage_bps) / 10000.0
+        friction_cost = pv * turnover * total_cost_rate
+
         stock_rets = []
         stopped = []
         for t in tickers:
@@ -329,7 +451,8 @@ def run_backtest_daily(
                 stock_rets.append(exit_px / entry - 1.0)
 
         gross_stock_ret = float(np.mean(stock_rets)) if stock_rets else 0.0
-        port_ret = invested * gross_stock_ret  # cash returns 0
+        port_ret_gross = invested * gross_stock_ret  # cash returns 0
+        port_ret = port_ret_gross - (friction_cost / pv if pv > 0 else 0.0)
 
         if port_ret <= -portfolio_dd_cash_trigger:
             forced_cash_next = True
@@ -339,6 +462,9 @@ def run_backtest_daily(
             {
                 "date": d0,
                 "portfolio_return": port_ret,
+                "portfolio_return_gross": port_ret_gross,
+                "friction_cost": float(friction_cost),
+                "turnover": float(turnover),
                 "regime": ["HIGH_VOL", "BULL", "BEAR"][regime],
                 "stocks_held": tickers,
                 "stops_hit": stopped,
@@ -348,6 +474,7 @@ def run_backtest_daily(
                 "invested_weight": invested,
             }
         )
+        prev_holdings = new_holdings
 
     df = pd.DataFrame(results)
     if df.empty:
