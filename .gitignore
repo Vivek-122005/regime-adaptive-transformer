@@ -25,7 +25,8 @@ eda/eda_executed.ipynb
 # OS
 .DS_Store
 Thumbs.db
-
+REPO_AUDIT.md
+VIva.md
 # IDE
 .vscode/
 .idea/
