@@ -1,0 +1,42 @@
+{
+  "artifact_dir": "/Users/shivanshgupta/regime-adaptive-transformer/models/ramt/artifacts",
+  "walk_forward": {
+    "test_start": "2023-01-01",
+    "test_end": "2026-04-15",
+    "training_step": 126,
+    "n_segments": 7
+  },
+  "main_checkpoint": {
+    "path": "/Users/shivanshgupta/regime-adaptive-transformer/models/ramt/artifacts/ramt_model_state.pt",
+    "n_parameters": 131298,
+    "config": {
+      "seq_len": 30,
+      "num_heads": 8,
+      "num_transformer_layers": 2,
+      "num_experts": 1,
+      "dropout": 0.2
+    },
+    "resolved_config": {
+      "seq_len": 30,
+      "num_heads": 8,
+      "num_transformer_layers": 2,
+      "num_experts": 1,
+      "dropout": 0.2
+    },
+    "fold_label": "WF seg 1/1 train_end<=2022-12-31"
+  },
+  "blind_test_window": {
+    "start": "2024-01-01",
+    "end": "2026-04-16"
+  },
+  "DA_pct": 47.2308,
+  "RMSE": 0.0722624001968482,
+  "MAE": 0.052588590886638927,
+  "mean_IC": -0.016237236926569084,
+  "top5_positive_rate": 0.5769230769230769,
+  "n_blind_rows": 5200,
+  "n_blind_rebalance_dates": 26,
+  "Sharpe": 0.48535982202244204,
+  "MaxDD": -0.06374817253464178,
+  "n_rebalances": 25
+}

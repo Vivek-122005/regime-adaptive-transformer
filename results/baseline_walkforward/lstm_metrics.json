@@ -1,0 +1,10 @@
+{
+  "model": "baseline_lstm_walkforward",
+  "directional_accuracy": 0.48912404467960025,
+  "DA_pct": 48.91240446796002,
+  "mean_IC": -0.04063604240282685,
+  "rmse": 0.013819442763039973,
+  "mae": 0.010270503826535684,
+  "n_rows": 1701,
+  "predictions_csv": "/Users/shivanshgupta/regime-adaptive-transformer/results/baseline_walkforward/lstm_predictions.csv"
+}

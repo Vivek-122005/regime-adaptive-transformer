@@ -1,0 +1,10 @@
+{
+  "model": "baseline_xgboost_walkforward",
+  "directional_accuracy": 0.49441504997060554,
+  "DA_pct": 49.441504997060555,
+  "mean_IC": -0.060954063604240286,
+  "rmse": 0.012564735006199054,
+  "mae": 0.009014062286156867,
+  "n_rows": 1701,
+  "predictions_csv": "/Users/shivanshgupta/regime-adaptive-transformer/results/baseline_walkforward/xgboost_predictions.csv"
+}

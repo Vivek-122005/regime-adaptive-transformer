@@ -10,7 +10,7 @@ env/
 # Data (too large for git)
 data/raw/*.csv
 data/processed/*.csv
-results/*.csv
+# results/ outputs are versioned for dashboards & reproducibility (CSV/JSON; keep sizes reasonable)
 
 # Models
 checkpoints/*.pt
