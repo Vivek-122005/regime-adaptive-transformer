@@ -1,8 +1,8 @@
 """
 Test 3 — Parameter sensitivity: rerun run_backtest_daily with varied hyperparameters.
 
-Reads predictions from the repo (default: results/ranking_predictions.csv) and writes
-ONLY under results/sensitivity/ — does not overwrite results/backtest_results.csv.
+Reads predictions from the repo (default: results/final_strategy/ranking_predictions.csv) and writes
+ONLY under results/final_strategy/sensitivity/ — does not overwrite results/final_strategy/backtest_results.csv.
 
 Usage (from repo root):
   python scripts/parameter_sensitivity_backtest.py
@@ -90,14 +90,14 @@ def main() -> None:
     parser.add_argument(
         "--predictions",
         type=str,
-        default=str(ROOT / "results" / "ranking_predictions.csv"),
+        default=str(ROOT / "results" / "final_strategy" / "ranking_predictions.csv"),
         help="Path to ranking_predictions.csv (read-only)",
     )
     parser.add_argument(
         "--out-dir",
         type=str,
-        default=str(ROOT / "results" / "sensitivity"),
-        help="Output directory (default: results/sensitivity)",
+        default=str(ROOT / "results" / "final_strategy" / "sensitivity"),
+        help="Output directory (default: results/final_strategy/sensitivity)",
     )
     args = parser.parse_args()
 

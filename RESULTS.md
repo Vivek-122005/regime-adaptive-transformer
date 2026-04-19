@@ -19,7 +19,7 @@ Single place to record **measured outcomes** from experiments (backtests, ablati
 | 2013–01-01 — 2015–12-31 | Momentum `Ret_21d`; same **NIFTY 100 proxy** | **79** (100) | 0.16 | 0.8% | -33.2% | 0.15 | 0.6% | -33.2% | Pre-demonetization; India bull with volatility |
 | 2024–01-01 — 2025–12-31 | **RAMT** `ranking_predictions.csv` (not momentum) | n/a (full OOS pipeline) | 0.66 | 10.6% | -18.7% | 1.35 | 43.0% | -19.7% | Modern RAMT blind-test window |
 
-**Artifacts (per historical window):** `data/raw_yf_<tag>/` (includes `_fetch_stats.json` after fetch), `data/processed_yf_<tag>/`, `results/momentum_rankings_yf_<tag>.csv`, `results/hmm_vs_flat/yf_<tag>/<start>_<end>/hmm_vs_flat_summary.csv`.
+**Artifacts (per historical window):** `data/raw_yf_<tag>/` (includes `_fetch_stats.json` after fetch), `data/processed_yf_<tag>/`, `results/final_strategy/momentum_rankings_yf_<tag>.csv`, `results/hmm_ablation/<tag>/<start>_<end>/hmm_vs_flat_summary.csv`. (Annual single-year runs live under `results/archive/hmm_vs_flat/yf_<year>/`.)
 
 **Reproduce historical chain (example 2013–2015):**
 
@@ -38,7 +38,7 @@ python scripts/run_yf_hmm_ablation.py \
 1. **Survivorship / universe:** Historical rows use **current** NSE index CSVs or the checked-in **NIFTY 100 proxy** — **not** point-in-time 2008/2010/2013 membership. All three historical windows are **survivorship-biased** relative to a true period index. The **2024–2025** column uses **RAMT** predictions, not momentum — compare cross-window levels qualitatively, not as a single homogeneous experiment.
 2. **Macro features in `feature_engineering`:** Same pipeline for all: INDIAVIX, crude, USDINR, SP500 lagged 1d. **INDIAVIX** has limited/fragile history in the 2008 era on Yahoo; rows are forward-filled / zeroed as in code. Not identical macro coverage quality across decades.
 3. **Failed downloads:** Many **NIFTY 100** names IPO’d after 2010 or have no Yahoo history for the window — see `_fetch_stats.json` failed lists (typically **~21–22** failed per 2010–2015 run; **2008–2010** used a wider NSE list with **~62** failed from an earlier full fetch).
-4. **Stops:** Per-stock stops in `run_backtest_daily` do not yet cut realized returns (audit flags only); see `results/sensitivity/parameter_sensitivity_meta.json`.
+4. **Stops:** Per-stock stops in `run_backtest_daily` do not yet cut realized returns (audit flags only); see `results/final_strategy/sensitivity/parameter_sensitivity_meta.json`.
 
 ### Earlier single-window notes (parameter sensitivity, 2024–2026 sensitivity grid)
 
@@ -49,7 +49,7 @@ python scripts/run_yf_hmm_ablation.py \
 
 **Test window:** 2024-01-01 — 2026-04-16 (blind test slice, `Period == "Test"`).
 
-**Artifacts:** `results/sensitivity/parameter_sensitivity_summary.csv`. **Reproduce:** `python scripts/parameter_sensitivity_backtest.py`
+**Artifacts:** `results/final_strategy/sensitivity/parameter_sensitivity_summary.csv`. **Reproduce:** `python scripts/parameter_sensitivity_backtest.py`
 
 ### What to call the HMM vs flat comparison
 
@@ -62,9 +62,9 @@ python scripts/run_yf_hmm_ablation.py \
 
 ## Parameter sensitivity (hyperparameter grid)
 
-One-off grid: `top_n`, stop-loss, sector cap, flat regime sizing. Summary table and per-variant backtest CSVs live under **`results/sensitivity/`**.
+One-off grid: `top_n`, stop-loss, sector cap, flat regime sizing. Summary table and per-variant backtest CSVs live under **`results/final_strategy/sensitivity/`**.
 
-**Caveat:** In the current `run_backtest_daily` implementation, per-stock stops flag `stops_hit` but **realized window returns use the full price path**, so varying `stop_loss` alone may not change PnL until stop-outs are applied to returns. See `results/sensitivity/parameter_sensitivity_meta.json`.
+**Caveat:** In the current `run_backtest_daily` implementation, per-stock stops flag `stops_hit` but **realized window returns use the full price path**, so varying `stop_loss` alone may not change PnL until stop-outs are applied to returns. See `results/final_strategy/sensitivity/parameter_sensitivity_meta.json`.
 
 ---
 
@@ -72,9 +72,9 @@ One-off grid: `top_n`, stop-loss, sector cap, flat regime sizing. Summary table 
 
 | Study | Metric(s) | Location | Date |
 |-------|-----------|----------|------|
-| Main backtest export | Per-window returns | `results/backtest_results.csv` | (update when regenerated) |
-| Walk-forward training history | Loss / fold | `results/training_history.csv`, `results/training_dashboard.png` | |
-| Ranking / predictions | Cross-sectional scores | `results/ranking_predictions.csv` | |
+| Main backtest export | Per-window returns | `results/final_strategy/backtest_results.csv` | (update when regenerated) |
+| Walk-forward training history | Loss / fold | `results/ramt/training_history.csv`, `results/ramt/training_dashboard.png` | |
+| Ranking / predictions | Cross-sectional scores | `results/final_strategy/ranking_predictions.csv` | |
 
 ---
 

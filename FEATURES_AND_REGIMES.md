@@ -4,7 +4,7 @@ This note documents **exactly what we feed to the RAMT model** (inputs), **what 
 
 **Current status (2026-04-15)**:
 
-- The **monthly ranking training** path exists in `models/ramt/train_ranking.py` and writes `results/ranking_predictions.csv` when you have many processed tickers with `Monthly_Alpha`.
+- The **monthly ranking training** path exists in `models/ramt/train_ranking.py` and writes `results/ramt/ranking_predictions.csv` when you have many processed tickers with `Monthly_Alpha` (standalone `__main__`); the final runner writes strategy CSVs under `results/final_strategy/`.
 - The **portfolio backtest** in `models/backtest.py` is currently a **scaffold** (not wired end-to-end yet).
 - Separately, the repo also contains a **daily next-day return** path (XGBoost/LSTM/RAMT) that writes `results/*_predictions.csv`. That daily target is **not** `Monthly_Alpha`.
 

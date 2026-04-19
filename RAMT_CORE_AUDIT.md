@@ -246,7 +246,7 @@ Defined in `(models/ramt/train_ranking.py:L479–L535)`.
 
 ### 2.3 Save / load paths
 
-- Written by `save_ramt_inference_artifacts`: `results/ramt_scaler.joblib`, `results/ramt_y_scaler.joblib` `(models/ramt/train_ranking.py:L1058–L1062)`.
+- Written by `save_ramt_inference_artifacts`: `results/ramt/ramt_scaler.joblib`, `results/ramt/ramt_y_scaler.joblib` `(models/ramt/train_ranking.py:L1058–L1062)`.
 - Fold snapshots: `ramt_scaler_{tag}.joblib`, `ramt_y_scaler_{tag}.joblib` `(models/ramt/train_ranking.py:L1064–L1068)`.
 
 ### 2.4 Training-only statistics (leakage)
@@ -362,7 +362,7 @@ In `_train_one_epoch` with `USE_TOURNAMENT_LOSS = True`, total loss is:
 | Mixed precision | **NOT FOUND IN CURRENT CODEBASE** (no `torch.cuda.amp` / autocast in training) | grep `autocast` in `*.py` |
 | Epochs | `MAX_EPOCHS = 30`, overridable by `max_epochs` argument | `(models/ramt/train_ranking.py:L108, L294–L295)` |
 | Early stopping | On **validation loss** `v`; `PATIENCE = 8`; `best` improved when `v < best` (no `min_delta`) | `(models/ramt/train_ranking.py:L109, L305–L332)` |
-| Checkpointing | Best **val loss** state dict kept in memory; `save_ramt_inference_artifacts` writes `results/ramt_model_state.pt` when `plot_dir` set and **seg_idx == 0** only inside `combined_walk_forward` — fold-tagged copies when `artifact_dir` set | `(models/ramt/train_ranking.py:L325–L346, L1136–L1158, L1020–L1074)` |
+| Checkpointing | Best **val loss** state dict kept in memory; `save_ramt_inference_artifacts` writes `results/ramt/ramt_model_state.pt` when `plot_dir` set and **seg_idx == 0** only inside `combined_walk_forward` — fold-tagged copies when `artifact_dir` set | `(models/ramt/train_ranking.py:L325–L346, L1136–L1158, L1020–L1074)` |
 | Validation metric | **Combined val loss** (same formula as train: rank + `AUX_DAILY_WEIGHT * mse_d`), **not** Sharpe/DA | `(models/ramt/train_ranking.py:L865–L927)` |
 | Device | `mps` if available, else `cuda`, else `cpu` | `(models/ramt/train_ranking.py:L93–L98)` |
 
@@ -408,7 +408,7 @@ Examples (non-exhaustive): `RET_21D_INPUT_SCALE = 1.65` `(models/ramt/encoder.py
 
 ### 8.3 References to `.pt` artifacts
 
-- Canonical inference path: `results/ramt_model_state.pt` `(models/permutation_importance.py:L114)`, `(models/inspect_attention.py:L102)`, `(models/attention_consistency_report.py:L49)`, `(dashboard/app.py:L1369)`.
+- Canonical inference path: `results/ramt/ramt_model_state.pt` `(models/permutation_importance.py)`, `(models/inspect_attention.py)`, `(models/attention_consistency_report.py)`, `(dashboard/app.py)`.
 - Walk-forward also writes `ramt_model_state_{tag}.pt` e.g. `wf_seg_01` `(models/ramt/train_ranking.py:L1064–L1067, L1157)`.
 
 ### 8.4 Inconsistencies (docs / comments vs code)

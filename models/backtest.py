@@ -844,7 +844,7 @@ def compute_max_drawdown(returns) -> float:
 
 if __name__ == "__main__":
     print("Loading predictions...")
-    # Load from results/ranking_predictions.csv
+    # Load from results/final_strategy/ranking_predictions.csv
     # Run backtest
     # Print results
     raise SystemExit(

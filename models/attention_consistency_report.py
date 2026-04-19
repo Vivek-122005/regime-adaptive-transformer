@@ -4,7 +4,7 @@ Generate an attention consistency report across many rebalance dates.
 This answers: "Is the model consistently focusing on similar days, or is it random?"
 
 Outputs:
-  - results/attention_consistency.csv
+  - results/ramt/attention/attention_consistency.csv
 
 Usage:
   .venv/bin/python models/attention_consistency_report.py --ticker TCS_NS --n 12
@@ -25,11 +25,12 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT))
 
 from models.inspect_attention import _extract_sequence, _load_processed, _mean_attention_from_model  # noqa: E402
+from models.ramt.dataset import TICKER_TO_ID  # noqa: E402
 from models.ramt.model import build_ramt  # noqa: E402
 
 
 def _rebalance_dates_from_predictions() -> list[pd.Timestamp]:
-    p = ROOT / "results" / "ranking_predictions.csv"
+    p = ROOT / "results" / "final_strategy" / "ranking_predictions.csv"
     df = pd.read_csv(p, parse_dates=["Date"])
     dates = sorted(pd.to_datetime(df["Date"]).dropna().unique().tolist())
     return [pd.Timestamp(d) for d in dates]
@@ -46,8 +47,8 @@ def main():
     n = int(args.n)
     seq_len = int(args.seq_len)
 
-    state_path = ROOT / "results" / "ramt_model_state.pt"
-    scaler_path = ROOT / "results" / "ramt_scaler.joblib"
+    state_path = ROOT / "results" / "ramt" / "ramt_model_state.pt"
+    scaler_path = ROOT / "results" / "ramt" / "ramt_scaler.joblib"
     if not state_path.exists() or not scaler_path.exists():
         raise FileNotFoundError(
             "Missing artifacts. Run `python models/run_final_2024_2026.py` first."
@@ -94,7 +95,7 @@ def main():
         )
 
     out = pd.DataFrame(rows)
-    out_dir = ROOT / "results"
+    out_dir = ROOT / "results" / "ramt" / "attention"
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / "attention_consistency.csv"
     out.to_csv(out_path, index=False)

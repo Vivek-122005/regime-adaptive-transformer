@@ -8,7 +8,7 @@ Example::
 
   python scripts/momentum_predictions_from_features.py \\
     --processed-dir data/processed_yf_2008_2010 \\
-    --output results/yf_momentum_rankings_2008_2010.csv \\
+    --output results/final_strategy/momentum_rankings_yf_2008_2010.csv \\
     --start 2008-01-01 \\
     --end 2010-12-31 \\
     --rebalance-every 21

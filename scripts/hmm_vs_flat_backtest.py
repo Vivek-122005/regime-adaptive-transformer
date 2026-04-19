@@ -8,7 +8,8 @@ Compare two portfolio rules on the same ranking file:
 
 This is **not** “train RAMT without HMM in the model”; predictions are identical.
 
-Writes under ``results/hmm_vs_flat/`` only (does not overwrite ``backtest_results.csv``).
+Writes under ``results/hmm_ablation/<phase>/`` (or a custom ``--out-dir``) only
+(does not overwrite ``results/final_strategy/backtest_results.csv``).
 
 Examples::
 
@@ -92,12 +93,12 @@ def main() -> None:
     p.add_argument(
         "--predictions",
         type=str,
-        default=str(ROOT / "results" / "ranking_predictions.csv"),
+        default=str(ROOT / "results" / "final_strategy" / "ranking_predictions.csv"),
     )
     p.add_argument(
         "--out-dir",
         type=str,
-        default=str(ROOT / "results" / "hmm_vs_flat"),
+        default=str(ROOT / "results" / "hmm_ablation"),
     )
     p.add_argument(
         "--include-train",

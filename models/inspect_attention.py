@@ -2,11 +2,11 @@
 Inspect RAMT attention over the 30-day input window.
 
 This script loads:
-  - results/ramt_model_state.pt
-  - results/ramt_scaler.joblib
-and produces:
-  - results/attention_last_token.csv  (importance of each day to the last day)
-  - results/attention_map_mean.csv    (seq_len x seq_len mean attention)
+  - results/ramt/ramt_model_state.pt
+  - results/ramt/ramt_scaler.joblib
+and produces (under ``results/ramt/attention/``):
+  - ``<prefix>_last_token.csv``  (importance of each day to the last day)
+  - ``<prefix>_map_mean.csv``    (seq_len x seq_len mean attention)
 
 Usage:
   .venv/bin/python models/inspect_attention.py --ticker TCS_NS --date 2024-10-09
@@ -90,7 +90,7 @@ def main():
         "--out-prefix",
         default="attention",
         type=str,
-        help="output filename prefix inside results/",
+        help="output filename prefix inside results/ramt/attention/",
     )
     args = ap.parse_args()
 
@@ -99,12 +99,12 @@ def main():
     seq_len = int(args.seq_len)
     out_prefix = str(args.out_prefix).strip() or "attention"
 
-    state_path = ROOT / "results" / "ramt_model_state.pt"
-    scaler_path = ROOT / "results" / "ramt_scaler.joblib"
+    state_path = ROOT / "results" / "ramt" / "ramt_model_state.pt"
+    scaler_path = ROOT / "results" / "ramt" / "ramt_scaler.joblib"
     if not state_path.exists() or not scaler_path.exists():
         raise FileNotFoundError(
             "Missing artifacts. Run `python models/run_final_2024_2026.py` first "
-            "to generate results/ramt_model_state.pt and results/ramt_scaler.joblib."
+            "to generate results/ramt/ramt_model_state.pt and results/ramt/ramt_scaler.joblib."
         )
 
     payload = torch.load(state_path, map_location="cpu")
@@ -127,7 +127,7 @@ def main():
 
     attn_mean, last_token = _mean_attention_from_model(model)
 
-    out_dir = ROOT / "results"
+    out_dir = ROOT / "results" / "ramt" / "attention"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     # Save matrix and last-token vector

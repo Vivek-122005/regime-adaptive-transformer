@@ -49,7 +49,7 @@ def _default_artifact_dir() -> Path:
     cand = ROOT / "models" / "ramt" / "artifacts"
     if cand.is_dir() and any(cand.glob("ramt_model_state_wf_seg_01.pt")):
         return cand
-    fall = ROOT / "results"
+    fall = ROOT / "results" / "ramt"
     if fall.is_dir() and any(fall.glob("ramt_model_state_wf_seg_01.pt")):
         return fall
     return Path("ramt model results")
@@ -365,7 +365,7 @@ def main() -> None:
 
     dash_src = artifact_dir / "training_dashboard.png"
     if not dash_src.is_file():
-        dash_src = ROOT / "results" / "training_dashboard.png"
+        dash_src = ROOT / "results" / "ramt" / "training_dashboard.png"
     if dash_src.is_file():
         import shutil
 

@@ -1,7 +1,7 @@
 """
 NIFTY 500 (current NSE snapshot) × six calendar years (2010–2015): full yfinance pipeline
 per year — separate ``data/raw_yf_<year>``, ``data/processed_yf_<year>``, momentum rankings,
-and ``results/hmm_vs_flat/yf_<year>/``.
+and ``results/archive/hmm_vs_flat/yf_<year>/`` (annual single-year runs preserved under archive).
 
 Ranking signal is **pure Ret_21d** via ``momentum_predictions_from_features.py`` (unchanged).
 
@@ -140,7 +140,7 @@ def main() -> None:
         end_ex = f"{year + 1}-01-01"
         bt_end = f"{year}-12-31"
         raw_dir = ROOT / "data" / f"raw_yf_{tag}"
-        out_hmm = ROOT / "results" / "hmm_vs_flat" / f"yf_{tag}"
+        out_hmm = ROOT / "results" / "archive" / "hmm_vs_flat" / f"yf_{tag}"
 
         if not args.report_only:
             cmd = [
@@ -189,7 +189,7 @@ def main() -> None:
         "### NIFTY 500 annual sub-windows (2010–2015, momentum `Ret_21d` only)",
         "",
         "Universe: **current NIFTY 500** snapshot (`scripts/universe/nifty500_nse_survivorship_proxy.txt`). "
-        "Separate `raw_yf_<year>` / `processed_yf_<year>` / `hmm_vs_flat/yf_<year>/` per calendar year.",
+        "Separate `raw_yf_<year>` / `processed_yf_<year>` / `archive/hmm_vs_flat/yf_<year>/` per calendar year.",
         "",
         "| Year | Equities OK (requested 500) | HMM Sharpe | HMM CAGR | HMM Max DD | Flat Sharpe | Flat CAGR | Flat Max DD | NIFTY B&H (year) |",
         "|------|----------------------------|------------|----------|------------|-------------|-----------|-------------|------------------|",

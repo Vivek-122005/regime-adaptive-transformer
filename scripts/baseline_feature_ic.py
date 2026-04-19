@@ -138,7 +138,7 @@ def main():
     print("RAMT (from ranking_predictions.csv, for comparison)")
     print("=" * 60)
     try:
-        preds = pd.read_csv("results/ranking_predictions.csv", parse_dates=["Date"])
+        preds = pd.read_csv("results/final_strategy/ranking_predictions.csv", parse_dates=["Date"])
         # Panel files use yfinance-style tickers (e.g. SBIN.NS); exports may use SBIN_NS
         preds = preds.copy()
         preds["Ticker"] = preds["Ticker"].str.replace("_NS", ".NS", regex=False)

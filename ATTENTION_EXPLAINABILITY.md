@@ -45,8 +45,8 @@ Important limitation:
 
 ### Step A — Train once and save artifacts
 Running the final runner will train and also save:
-- `results/ramt_model_state.pt`
-- `results/ramt_scaler.joblib`
+- `results/ramt/ramt_model_state.pt`
+- `results/ramt/ramt_scaler.joblib`
 
 Command:
 
@@ -55,22 +55,21 @@ Command:
 ```
 
 ### Step B — Inspect attention for a specific rebalance date
-Pick a `Date` that exists in `results/ranking_predictions.csv`, then run:
+Pick a `Date` that exists in `results/final_strategy/ranking_predictions.csv`, then run:
 
 ```bash
 .venv/bin/python models/inspect_attention.py --ticker TCS_NS --date 2024-10-09
 ```
 
 Outputs:
-- `results/attention_map_mean.csv` (legacy filename; new runs use a prefix by default)
+- `results/ramt/attention/<prefix>_map_mean.csv` (legacy docs referred to `attention_map_mean.csv` at repo root; new runs use a prefix under `results/ramt/attention/`)
   - mean attention matrix (30×30), averaged across experts/layers/heads
-- `results/attention_last_token.csv` (legacy filename; new runs use a prefix by default)
+- `results/ramt/attention/<prefix>_last_token.csv`
   - a single vector of length 30: how much the **last timestep** attends to each day
 
 New (recommended) outputs (prefix is configurable with `--out-prefix`):
-- `results/attention_map_mean.csv` becomes `results/<prefix>_map_mean.csv`
-- `results/attention_last_token.csv` becomes `results/<prefix>_last_token.csv`
-- plus `results/<prefix>_heatmap.html` (and optionally `<prefix>_heatmap.png` if `kaleido` is installed)
+- outputs are written under `results/ramt/attention/` as `<prefix>_map_mean.csv`, `<prefix>_last_token.csv`
+- plus `<prefix>_heatmap.html` (and optionally `<prefix>_heatmap.png` if `kaleido` is installed)
 
 Example:
 
@@ -85,7 +84,7 @@ Example:
 ```
 
 Output:
-- `results/attention_consistency.csv` (top attended days + “mass on last 5/10 days” + entropy)
+- `results/ramt/attention/attention_consistency.csv` (top attended days + “mass on last 5/10 days” + entropy)
 
 Index meaning:
 - `day_index = 0` is the **oldest** day in the 30-day block
@@ -96,13 +95,13 @@ Index meaning:
 ## 4) What to look for in the results
 
 ### A) “Last token attention” (most practical)
-Open `results/attention_last_token.csv` and check:
+Open `results/ramt/attention/<prefix>_last_token.csv` and check:
 - Is most weight near day 29 (recent days)?
 - Are there stable secondary peaks (e.g., day ~21, ~10)?
 - Does the shape remain similar across multiple rebalance dates?
 
 ### B) Full attention map
-In `results/attention_map_mean.csv`:
+In `results/ramt/attention/<prefix>_map_mean.csv`:
 - A strong diagonal-ish pattern often indicates “local recency” preference.
 - Off-diagonal structure indicates “the model uses older context as triggers”.
 

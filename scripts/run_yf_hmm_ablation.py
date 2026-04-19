@@ -47,7 +47,7 @@ def main() -> None:
     ap.add_argument(
         "--tag",
         default="2008_2010",
-        help="Suffix for data/raw_yf_<tag>, data/processed_yf_<tag>, results/momentum_rankings_yf_<tag>.csv",
+        help="Suffix for data/raw_yf_<tag>, data/processed_yf_<tag>, results/final_strategy/momentum_rankings_yf_<tag>.csv",
     )
     ap.add_argument("--skip-download", action="store_true")
     ap.add_argument("--skip-features", action="store_true")
@@ -62,7 +62,7 @@ def main() -> None:
 
     raw_dir = ROOT / "data" / f"raw_yf_{args.tag}"
     proc_dir = ROOT / "data" / f"processed_yf_{args.tag}"
-    pred_csv = ROOT / "results" / f"momentum_rankings_yf_{args.tag}.csv"
+    pred_csv = ROOT / "results" / "final_strategy" / f"momentum_rankings_yf_{args.tag}.csv"
     py = sys.executable
 
     if not args.skip_download:
@@ -112,7 +112,7 @@ def main() -> None:
             ]
         )
 
-    out_hmm = ROOT / "results" / "hmm_vs_flat" / f"yf_{args.tag}"
+    out_hmm = ROOT / "results" / "hmm_ablation" / args.tag
     run(
         [
             py,

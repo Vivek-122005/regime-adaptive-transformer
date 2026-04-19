@@ -1,7 +1,7 @@
 """
 Momentum + Regime + Sector — NIFTY 200 research dashboard.
 
-Loads all strategy metrics from ``results/backtest_results.csv`` and benchmarks
+Loads all strategy metrics from ``results/final_strategy/backtest_results.csv`` and benchmarks
 from ``data/raw/_NSEI.parquet``. No live model inference.
 """
 
@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 from features.feature_engineering import _safe_stem_from_ticker  # noqa: E402
 from features.sectors import get_sector  # noqa: E402
 
-BACKTEST_CSV = ROOT / "results" / "backtest_results.csv"
+BACKTEST_CSV = ROOT / "results" / "final_strategy" / "backtest_results.csv"
 NIFTY_PARQUET = ROOT / "data" / "raw" / "_NSEI.parquet"
 PROCESSED_DIR = ROOT / "data" / "processed"
 
@@ -34,7 +34,7 @@ ARCHIVE_MOM_NO_SECTOR = ROOT / "results" / "archive" / "momentum_regime_no_secto
 
 # Phase 1 / Phase 2 ML exports (optional — may be absent)
 # Walk-forward baselines (``models/baseline_xgboost.py`` / ``baseline_lstm.py`` → this folder)
-BASELINE_WALKFORWARD = ROOT / "results" / "baseline_walkforward"
+BASELINE_WALKFORWARD = ROOT / "results" / "phase1_baselines"
 PHASE1_DAILY = BASELINE_WALKFORWARD
 PHASE2_MONTHLY = ROOT / "results" / "phase2_monthly"
 RAMT_DIR = ROOT / "results" / "ramt"
@@ -1333,7 +1333,7 @@ def main() -> None:
         st.subheader("Data sources")
         st.text(f"Production backtest: {BACKTEST_CSV}")
         st.text(f"RAMT: {RAMT_DIR}")
-        st.text(f"Baseline WF (XGB/LSTM daily): {BASELINE_WALKFORWARD}")
+        st.text(f"Phase 1 baselines (XGB/LSTM daily): {BASELINE_WALKFORWARD}")
         st.text(f"Phase 2 monthly: {PHASE2_MONTHLY}")
         st.text(f"NIFTY raw: {NIFTY_PARQUET}")
         if not missing_bt:
@@ -1364,7 +1364,7 @@ def main() -> None:
 
     elif section == "Production strategy (momentum + HMM)":
         st.subheader("Production strategy — Momentum + regime + sector")
-        st.caption("Rules-based portfolio from `results/backtest_results.csv`.")
+        st.caption("Rules-based portfolio from `results/final_strategy/backtest_results.csv`.")
         if missing_nifty:
             st.error(f"Missing `{NIFTY_PARQUET}`.")
         elif missing_bt or bt is None or strat is None or bench is None:

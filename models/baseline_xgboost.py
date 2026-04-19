@@ -26,7 +26,7 @@ PROJECT_ROOT = Path.cwd()
 if not (PROJECT_ROOT / "data" / "processed").exists():
     PROJECT_ROOT = PROJECT_ROOT.parent
 PROCESSED_DIR = PROJECT_ROOT / "data" / "processed"
-RESULTS_DIR = PROJECT_ROOT / "results" / "baseline_walkforward"
+RESULTS_DIR = PROJECT_ROOT / "results" / "phase1_baselines"
 
 FEATURE_FILES = [
     ("JPM", "JPM_features.csv"),

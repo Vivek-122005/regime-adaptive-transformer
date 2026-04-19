@@ -9,13 +9,13 @@ Walk-forward: **retrain** every ``training_step`` (default 252 trading days ≈ 
 uses a 30-day warm-up requirement beyond the model sequence length for stable indicators.
 
 Produces:
-- results/ranking_predictions.csv
-- results/monthly_rankings.csv
-- results/backtest_results.csv
-- results/ramt_model_state.pt + scaler artifacts refreshed after every walk-forward fold
-- results/training_history.csv & results/training_dashboard.png (unless --no-plots)
+- results/final_strategy/ranking_predictions.csv
+- results/final_strategy/monthly_rankings.csv
+- results/final_strategy/backtest_results.csv
+- results/ramt/ramt_model_state.pt + scaler artifacts refreshed after every walk-forward fold
+- results/ramt/training_history.csv & results/ramt/training_dashboard.png (unless --no-plots)
 
-Use ``--backtest-only`` to skip training and reuse ``ranking_predictions.csv`` after a full run.
+Use ``--backtest-only`` to skip training and reuse ``final_strategy/ranking_predictions.csv`` after a full run.
 """
 
 from __future__ import annotations
@@ -129,11 +129,12 @@ def main() -> None:
         "--predictions",
         type=str,
         default=None,
-        help="Path to ranking_predictions.csv for --backtest-only (default: results/ranking_predictions.csv)",
+        help="Path to ranking_predictions.csv for --backtest-only (default: results/final_strategy/ranking_predictions.csv)",
     )
     args = parser.parse_args()
 
-    os.makedirs(ROOT / "results", exist_ok=True)
+    os.makedirs(ROOT / "results" / "final_strategy", exist_ok=True)
+    os.makedirs(ROOT / "results" / "ramt", exist_ok=True)
 
     # Strict blind split (matches train_ranking.py)
     train_start = "2020-01-01"
@@ -144,7 +145,7 @@ def main() -> None:
     preds_path = (
         Path(args.predictions)
         if args.predictions
-        else ROOT / "results" / "ranking_predictions.csv"
+        else ROOT / "results" / "final_strategy" / "ranking_predictions.csv"
     )
 
     if args.backtest_only:
@@ -168,7 +169,7 @@ def main() -> None:
         if args.batch_size is not None:
             tr.BATCH_SIZE = int(args.batch_size)
 
-        plot_dir = None if args.no_plots else str(ROOT / "results")
+        plot_dir = None if args.no_plots else str(ROOT / "results" / "ramt")
 
         rebalance_step = int(args.rebalance_step) if args.step_size is None else int(args.step_size)
         print(
@@ -184,10 +185,10 @@ def main() -> None:
             inference_warmup_days=int(args.inference_warmup_days),
             max_epochs=int(args.epochs),
             plot_dir=plot_dir,
-            artifact_dir=str(ROOT / "results"),
+            artifact_dir=str(ROOT / "results" / "ramt"),
         )
 
-        preds_out = ROOT / "results/ranking_predictions.csv"
+        preds_out = ROOT / "results" / "final_strategy" / "ranking_predictions.csv"
         preds.to_csv(preds_out, index=False)
         print(f"Saved: {preds_out}", flush=True)
 
@@ -195,7 +196,7 @@ def main() -> None:
         ["Date", "Ticker", "score", "actual_alpha", "Period"]
     ]
     rankings = add_momentum_column(rankings)
-    rankings_out = ROOT / "results/monthly_rankings.csv"
+    rankings_out = ROOT / "results/final_strategy/monthly_rankings.csv"
     rankings.to_csv(rankings_out, index=False)
     print(f"Saved: {rankings_out}", flush=True)
 
@@ -217,7 +218,7 @@ def main() -> None:
         kelly_use_predicted_margin=True,
         kelly_scale_position=True,
     )
-    bt_out = ROOT / "results/backtest_results.csv"
+    bt_out = ROOT / "results/final_strategy/backtest_results.csv"
     bt.to_csv(bt_out, index=False)
     print(f"Saved: {bt_out}", flush=True)
 

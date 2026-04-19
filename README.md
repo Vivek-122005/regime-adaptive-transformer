@@ -62,7 +62,7 @@ What I run now is deliberately boring. Each rebalance date I rank the 200 names 
 
 ## Final numbers
 
-Out-of-sample window from `2024-01-10` through `2026-01-27` on `results/backtest_results.csv`, with NIFTY buy-and-hold from `data/raw/_NSEI.parquet` over the same calendar span. Net of friction at 0.22% per rebalance when capital is deployed.
+Out-of-sample window from `2024-01-10` through `2026-01-27` on `results/final_strategy/backtest_results.csv`, with NIFTY buy-and-hold from `data/raw/_NSEI.parquet` over the same calendar span. Net of friction at 0.22% per rebalance when capital is deployed.
 
 Strategy vs NIFTY buy-and-hold:
 
@@ -90,7 +90,7 @@ Full progression across the project (each row is a different experiment, not the
 | Momentum + regime + sector cap | 13.5% | -18.7% | 0.83   |
 
 
-The last row is what `results/backtest_results.csv` represents today. The earlier rows are where the research actually traveled.
+The last row is what `results/final_strategy/backtest_results.csv` represents today. The earlier rows are where the research actually traveled.
 
 ## What I learned that I'll take to the next project
 
@@ -136,7 +136,7 @@ The last row is what `results/backtest_results.csv` represents today. The earlie
 **Backtest**
 
 - `models/backtest.py` — `run_backtest_daily`, regime wiring, friction, stops, killswitch.
-- `models/run_final_2024_2026.py` — end-to-end runner (train or `--backtest-only`), writes `results/backtest_results.csv`.
+- `models/run_final_2024_2026.py` — end-to-end runner (train or `--backtest-only`), writes `results/final_strategy/backtest_results.csv`.
 
 **Dashboard**
 
@@ -149,10 +149,10 @@ The last row is what `results/backtest_results.csv` represents today. The earlie
 
 **Results and artifacts**
 
-- `results/backtest_results.csv` — authoritative per-rebalance performance for the final strategy.
-- `results/ranking_predictions.csv`, `results/monthly_rankings.csv` — model or momentum ranking exports.
-- `results/ramt_model_state*.pt`, `results/ramt_scaler*.joblib`, `results/ramt_y_scaler*.joblib` — saved weights and scalers from training runs.
-- `results/training_history.csv`, `results/training_dashboard.png`, `results/training_log_*.txt` — training traces.
+- `results/final_strategy/backtest_results.csv` — authoritative per-rebalance performance for the final strategy.
+- `results/final_strategy/ranking_predictions.csv`, `results/final_strategy/monthly_rankings.csv` — model or momentum ranking exports.
+- `results/ramt/ramt_model_state*.pt`, `results/ramt/ramt_scaler*.joblib`, `results/ramt/ramt_y_scaler*.joblib` — saved weights and scalers from training runs.
+- `results/ramt/training_history.csv`, `results/ramt/training_dashboard.png`, `results/ramt/training_log_*.txt` — training traces.
 
 **Notebooks and docs**
 

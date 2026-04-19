@@ -1109,7 +1109,7 @@ def combined_walk_forward(
     step_size: int | None = None,
     inference_warmup_days: int = 30,
     max_epochs: int | None = None,
-    plot_dir: str | None = "results",
+    plot_dir: str | None = "results/ramt",
     artifact_dir: str | None = None,
 ) -> pd.DataFrame:
     """
@@ -1400,7 +1400,7 @@ def train_fixed_and_predict(
 
     # Save artifacts for later inspection (e.g., attention maps)
     save_ramt_inference_artifacts(
-        Path("results"),
+        Path("results/ramt"),
         model=model,
         scaler=scaler,
         y_scaler=y_scaler,
@@ -1450,7 +1450,7 @@ def train_fixed_and_predict(
 if __name__ == "__main__":
     print("Combined ranking training (walk-forward).", flush=True)
     df = combined_walk_forward()
-    os.makedirs("results", exist_ok=True)
-    out = "results/ranking_predictions.csv"
+    os.makedirs("results/ramt", exist_ok=True)
+    out = "results/ramt/ranking_predictions.csv"
     df.to_csv(out, index=False)
     print(f"Saved: {out}")

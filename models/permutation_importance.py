@@ -6,7 +6,7 @@ Goal:
   so we can drop them and reduce noise + compute.
 
 How it works:
-  1) Load trained model + scaler artifacts from results/
+  1) Load trained model + scaler artifacts from results/ramt/
   2) Build a validation sample set from the last part of the training period
   3) Compute baseline metric (Spearman IC between pred_monthly and y_monthly)
   4) For each feature column:
@@ -111,8 +111,8 @@ def main():
 
     np.random.seed(args.seed)
 
-    state_path = ROOT / "results" / "ramt_model_state.pt"
-    scaler_path = ROOT / "results" / "ramt_scaler.joblib"
+    state_path = ROOT / "results" / "ramt" / "ramt_model_state.pt"
+    scaler_path = ROOT / "results" / "ramt" / "ramt_scaler.joblib"
     if not state_path.exists() or not scaler_path.exists():
         raise FileNotFoundError("Missing results artifacts. Run models/run_final_2024_2026.py first.")
 
@@ -171,7 +171,7 @@ def main():
         )
 
     out = pd.DataFrame(results).sort_values("ic_drop", ascending=False)
-    out_path = ROOT / "results" / "permutation_importance.csv"
+    out_path = ROOT / "results" / "ramt" / "permutation_importance.csv"
     out.to_csv(out_path, index=False)
     print(f"Saved: {out_path}")
     print("\nTop 15 important features (by IC drop):")
