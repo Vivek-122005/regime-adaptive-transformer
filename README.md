@@ -4,7 +4,7 @@
 
 I set out to train a regime-adaptive transformer to pick stocks from NIFTY 200. After a month of experiments, the clean backtest said the transformer was dead money next to simple momentum, and a three-line pandas sort beat the multi-stack model on the metrics I cared about. This is that story, written as honestly as I can.
 
-## The goal, stated honestly
+## The goal
 
 I wanted to pick 5 stocks from NIFTY 200 each month, hold until the next rebalance with stops, and use an HMM-based regime signal to decide how much of the portfolio to put to work. On paper I aimed for directional accuracy above 54% and Sharpe above 1.0, because those were the academic targets that felt reasonable for a student project. What I actually wanted was simpler: beat NIFTY buy-and-hold by enough, after costs, that I could imagine allocating real money to the strategy and not feel foolish.
 

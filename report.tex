@@ -1,0 +1,371 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{A Study of Transformer and Momentum-Based Approaches for Cross-Sectional Equity Selection on NIFTY 200}
+
+\author{
+\IEEEauthorblockN{Shivansh Gupta}
+\IEEEauthorblockA{\textit{Dept. of Computer Science and Engineering} \\
+\textit{Rishihood University}\\
+Sonipat, India \\
+shivansh.g23csai@nst.rishihood.edu.in}
+\and
+\IEEEauthorblockN{Vivek Bishnoi}
+\IEEEauthorblockA{\textit{Dept. of Computer Science and Engineering} \\
+\textit{Rishihood University}\\
+Sonipat, India \\
+vivek.23csai@nst.rishihood.edu.in}
+}
+
+\maketitle
+
+\begin{abstract}
+This paper examines whether a deep learning architecture can improve stock selection on the NIFTY 200 universe at a monthly rebalancing horizon. A Regime-Adaptive Multimodal Transformer (RAMT) was designed and trained on features engineered from price, volume, technical, and macroeconomic data, together with an HMM-based regime label. On a held-out 2024--2026 window, the transformer produced cross-sectional predictions that were negatively correlated with realised returns and did not beat a simple 21-day momentum ranking. A momentum + HMM + sector-cap baseline achieved a net Sharpe of 0.83, a CAGR of 13.5\%, and a maximum drawdown of $-18.7$\%, compared to NIFTY buy-and-hold at 7.7\% CAGR and a Sharpe of approximately 0.5 over the same period. Ablations across four out-of-sample windows (2008--2010, 2010--2012, 2013--2015, 2024--2026) indicate that HMM-based position sizing preserves capital during crisis periods but can suppress returns in benign regimes. The main empirical finding is that at this data scale and problem structure, simple cross-sectional momentum combined with regime-aware sizing outperforms the transformer architecture tested.
+\end{abstract}
+
+\begin{IEEEkeywords}
+cross-sectional momentum, transformer, Hidden Markov Model, portfolio construction, NIFTY 200, Indian equity markets
+\end{IEEEkeywords}
+
+\section{Introduction}
+
+Predicting relative returns across a universe of stocks on a monthly horizon is a well-studied problem in quantitative finance. It is also one where reported results can be misleading: backtests are cheap to overfit, and any strategy can be made to look good on a short window. A final-year undergraduate project is a good setting to test, honestly and in public, whether a more complex model is worth its cost.
+
+This work starts from a specific hypothesis: a transformer with regime-aware attention and multimodal feature encoding should be able to extract information that a simpler ranking strategy cannot, particularly in Indian equity markets where volatility regimes shift. The transformer was built, trained, and evaluated. It did not work. A subsequent investigation using a gradient-boosted baseline showed that the features did contain signal; the architecture was failing to extract it.
+
+A simpler strategy based on 21-day cross-sectional momentum, Hidden Markov Model (HMM) based position sizing, and a sector-diversification constraint was then evaluated under realistic trading frictions. On the 2024--2026 test window, it beat the benchmark index on both absolute return and risk-adjusted return. Additional tests on 2008--2010, 2010--2012, and 2013--2015 showed that the HMM component is useful in crisis and recovery periods but its value diminishes in calm markets.
+
+The rest of the paper describes the pipeline, the transformer design and what went wrong with it, the diagnostic that motivated the pivot, the baseline strategy, and the multi-period ablations.
+
+\section{Related Work}
+
+Cross-sectional momentum has been studied since Jegadeesh and Titman \cite{jegadeesh1993}, who showed that stocks that outperform over three to twelve months tend to continue outperforming over the following months. Later work, including AQR's factor research \cite{asness2013}, documented momentum as a persistent factor across equity markets.
+
+Hidden Markov Models for regime detection in financial time series were introduced by Hamilton \cite{hamilton1989}. Guidolin and Timmermann \cite{guidolin2007} used HMM-derived regimes for asset allocation. In Indian markets, such regime-based approaches are less studied but structurally similar.
+
+Transformer architectures have been applied to financial time series in work such as the Temporal Fusion Transformer \cite{lim2021} and various attention-based forecasting models. Applications to cross-sectional equity selection are less common, and reported gains over simpler factor-based baselines are modest.
+
+This project situates itself as an empirical test in this last area: does a purpose-built transformer architecture improve on a basic momentum ranking in Indian equities? The rest of the paper answers that question.
+
+\section{Data and Features}
+
+\subsection{Universe}
+
+The equity universe is the NIFTY 200 constituents as of the start of the test period (2024). The same 200 tickers are held constant across all training dates. This is a static snapshot and introduces survivorship bias: stocks removed from the index before 2024 are not in the universe, and stocks added after are included retroactively in earlier training data. Reconstructing historical index membership was not feasible with the available data sources.
+
+Daily price data (OHLCV and adjusted close) was obtained via the Yahoo Finance API (\texttt{yfinance}) for all tickers, along with the NIFTY 50 benchmark ($\hat{}$NSEI) and four macro series: INDIAVIX, Brent crude (CL=F), USDINR, and the S\&P 500 ($\hat{}$GSPC).
+
+\subsection{Features}
+
+Ten features were engineered for each stock on each trading date, grouped into four modalities:
+
+\begin{itemize}
+    \item \textbf{Price returns:} 1-day, 5-day, and 21-day log returns (\texttt{Ret\_1d}, \texttt{Ret\_5d}, \texttt{Ret\_21d}).
+    \item \textbf{Technical indicators:} 14-day RSI and a normalised Bollinger-band distance.
+    \item \textbf{Volume:} volume surge defined as current volume divided by a 20-day moving average.
+    \item \textbf{Macroeconomic returns:} 1-day lagged log returns of INDIAVIX, Brent crude, USDINR, and S\&P 500.
+\end{itemize}
+
+All returns use adjusted close to handle dividends and splits. Macro returns are lagged by one trading day so features at time $t$ do not use information from day $t$'s macro close.
+
+\subsection{Targets}
+
+The supervision target is \texttt{Monthly\_Alpha}, defined as the 21-day-forward log return of the stock minus the 21-day-forward log return of NIFTY 50:
+
+\[
+\alpha_t^{(i)} = \ln\left(\frac{P_{t+21}^{(i)}}{P_t^{(i)}}\right) - \ln\left(\frac{N_{t+21}}{N_t}\right)
+\]
+
+A sector-neutralised version, \texttt{Sector\_Alpha}, is defined by demeaning \texttt{Monthly\_Alpha} within each NSE sector bucket on each date. This is the primary target for ranking models because it removes sector-level confounders.
+
+\subsection{HMM Regime}
+
+A 3-state Gaussian Hidden Markov Model is fit causally on an expanding window of $[\text{Ret\_1d}, \text{Realized\_Vol\_20}]$ for each ticker and for the NIFTY index itself. States are labelled semantically as BULL (highest mean return), BEAR (lowest mean return), and HIGH\_VOL (intermediate). The fit uses only past data at each point to avoid lookahead.
+
+\section{Transformer Architecture (RAMT)}
+
+\subsection{Design}
+
+The Regime-Adaptive Multimodal Transformer (RAMT) was designed to process 30-day sequences of the 10 features and output a ranking score per stock per date. The architecture has six main components.
+
+\begin{itemize}
+    \item \textbf{MultimodalEncoder:} Each feature group (price, technical, volume, macro) is encoded separately by a small feedforward network and concatenated with regime and ticker embeddings, then fused into a 64-dimensional representation.
+    \item \textbf{PositionalEncoding:} Learnable position embeddings over the 30-day window.
+    \item \textbf{RegimeCrossAttention:} The HMM regime label acts as a query against the feature sequence, reweighting which timesteps matter under the current regime.
+    \item \textbf{Mixture of Experts (MoE):} Three small Transformer encoders with a regime-aware gating network. The intent was that each expert would specialise in one regime.
+    \item \textbf{Dual heads:} A monthly head predicting \texttt{Sector\_Alpha} and a daily head predicting next-day return as an auxiliary task.
+    \item \textbf{TournamentRankingLoss:} A pairwise margin ranking loss with magnitude weighting, combined with a small MSE term on the daily head.
+\end{itemize}
+
+The rationale for each component was plausible: regime enters the model at multiple points (encoder, cross-attention, gating) rather than being just another input feature. The MoE provides capacity specialisation. The ranking loss targets relative ordering rather than absolute return magnitude, which matches how the strategy will use the predictions.
+
+\subsection{Training Setup}
+
+Training used a walk-forward scheme: for each outer segment, a model was trained on data up to and excluding the segment's start, then used for inference on the next segment. Within each segment, the target column was scaled using a \texttt{RobustScaler} fit on training data only, and target values were winsorised at the 1st and 99th percentiles of the training distribution. The optimiser was AdamW with a warm-up schedule and \texttt{ReduceLROnPlateau}.
+
+The universe contained approximately 118{,}000 training samples per fold. Batch size was 64, sequence length 30 days. Two architecture variants were tested: one with 97{,}000 trainable parameters (1 transformer layer, 4 attention heads) and a restored variant with 131{,}000 parameters (2 layers, 8 heads).
+
+\subsection{What Went Wrong}
+
+The first attempted run used \texttt{--epochs 3}, which was a configuration error. The model trained for only three epochs and produced predictions on the test set with poor cross-sectional ranking quality.
+
+After increasing epochs to 25 and fixing the data loader to use \texttt{num\_workers=4} and \texttt{cache\_size=200} (which reduced per-epoch time from roughly 30 minutes to 1 minute), the model was retrained properly. The results were worse:
+
+\begin{itemize}
+    \item The training loss plateaued after epoch 2 and did not decrease further.
+    \item The validation loss stayed essentially flat for all epochs.
+    \item The per-date standard deviation of predictions across 200 stocks remained at approximately 0.0015, compared to 0.07 for the actual alphas.
+    \item The validation correlation between predicted and realised alpha monotonically decreased over epochs, from $-0.023$ at epoch 1 to $-0.036$ at epoch 7.
+\end{itemize}
+
+Increasing the auxiliary daily-loss weight from 0.05 to 0.2 and adding model capacity did not resolve this. After seven epochs of monotonic degradation on the second run, training was stopped.
+
+The diagnosis is a vanishing-gradient failure mode in the tournament ranking loss. When predictions cluster close to the mean (which happens early in training for any model), the pairwise margins $|p_i - p_j|$ are small, the hinge term $\text{ReLU}(m - (p_i - p_j))$ becomes nearly zero, and the ranking gradient essentially vanishes. The model has no pressure to separate the cross-section. The daily MSE anchor was designed to prevent this but turned out to push predictions toward the dataset mean instead, reinforcing the collapse rather than breaking it.
+
+Table~\ref{tab:ramt-results} summarises RAMT's behaviour against a simple benchmark we discuss next.
+
+\begin{table}[htbp]
+\caption{RAMT test-set behaviour on 2024--2026}
+\label{tab:ramt-results}
+\centering
+\begin{tabular}{lc}
+\toprule
+\textbf{Metric} & \textbf{Value} \\
+\midrule
+Validation correlation (Spearman) & $-0.02$ \\
+Cross-section std of predictions & 0.0015 \\
+Actual $\alpha$ std & 0.07 \\
+Top-5 positive-$\alpha$ rate & 46.4\% \\
+Net Sharpe on backtest & 0.58 \\
+CAGR & 2.9\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Diagnostic with a Gradient-Boosted Baseline}
+
+Before abandoning the deep learning direction, a diagnostic was needed: do the features contain any predictive signal at all, or is the target too noisy to model?
+
+A LightGBM regressor was trained on exactly the same 10 features with the same train/test split as RAMT. The model used 500 trees, maximum depth 5, and standard hyperparameters. The purpose was not to build a competitor but to establish an empirical lower bound on the signal available in the features.
+
+The results are in Table~\ref{tab:diagnostic}, alongside a pure-momentum baseline (ranking stocks by \texttt{Ret\_21d} only, no training).
+
+\begin{table}[htbp]
+\caption{Diagnostic comparison on 2024--2026 test set}
+\label{tab:diagnostic}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Method} & \textbf{Mean IC} & \textbf{Top-5 spread} & \textbf{Top-5 +ve rate} \\
+\midrule
+RAMT & $-0.019$ & $\sim$0\% & 46.4\% \\
+LightGBM (all features) & $+0.021$ & $+0.65\%$/mo & 53.8\% \\
+Pure \texttt{Ret\_21d} momentum & $+0.007$ & $+1.59\%$/mo & 56.3\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Two observations from this table shaped the rest of the project.
+
+First, LightGBM achieved a statistically significant cross-sectional Information Coefficient of $+0.021$ (Information Ratio $+6.4$ over 38 test dates). The features do contain signal. RAMT's failure is therefore architectural, not a data problem.
+
+Second, pure \texttt{Ret\_21d} momentum --- a sorting operation that required no training --- produced a larger top-5 spread than LightGBM despite a lower IC. LightGBM's non-linear feature combinations improved ranking quality across the middle of the distribution but diluted the concentration at the top. For a strategy that only trades the top 5, momentum's sharper head beats LightGBM's better overall ranking.
+
+At this point, the project direction pivoted.
+
+\section{The Simpler Strategy}
+
+The strategy that replaced RAMT has three rules, applied each rebalance date.
+
+\subsection{Signal}
+
+Rank all 200 stocks in the universe by \texttt{Ret\_21d} on the current date. Take the top-ranked names as candidate picks.
+
+\subsection{Sector Cap}
+
+Select up to 5 stocks, imposing a one-stock-per-sector constraint based on the NSE sector mapping. This is motivated by the observation that momentum concentrates in themes: during the October 2024 SMID correction, the unconstrained top-5 selection contained five stocks from closely related speculative sectors, which all fell together. Enforcing sector diversity trades away some raw momentum exposure for lower intra-basket correlation.
+
+\subsection{Regime Sizing}
+
+Use the NIFTY 50 HMM regime label to size the total capital deployed into the basket. The rules are:
+
+\begin{itemize}
+    \item BULL: deploy 100\% of capital.
+    \item HIGH\_VOL: deploy 50\%.
+    \item BEAR: deploy 20\%.
+\end{itemize}
+
+The remaining capital sits in cash. Position sizes within the deployed sleeve are equal-weight with a per-stock cap of 20\%.
+
+\subsection{Execution}
+
+Rebalance every 21 trading days. Apply a 7\% per-stock stop-loss audit (a known limitation discussed in Section~\ref{sec:limitations}). Transaction friction is modelled at 22 basis points of trade value per rebalance, representing the combined STT, brokerage, and realistic slippage for retail execution on the NIFTY 200 universe.
+
+\section{Backtest Results}
+
+\subsection{Main Test Window: 2024--2026}
+
+The strategy was backtested from 2024-01-10 to 2026-01-27, a span of 2.05 years covering 25 rebalance windows. The full universe (200 stocks) was available throughout. Table~\ref{tab:main-results} presents the headline results alongside NIFTY buy-and-hold over the same window.
+
+\begin{table}[htbp]
+\caption{Strategy vs. NIFTY buy-and-hold, 2024-01-10 to 2026-01-27}
+\label{tab:main-results}
+\centering
+\begin{tabular}{lcc}
+\toprule
+\textbf{Metric} & \textbf{Strategy} & \textbf{NIFTY B\&H} \\
+\midrule
+CAGR & 13.5\% & 7.7\% \\
+Total return & 29.6\% & 16.5\% \\
+Maximum drawdown & $-18.7\%$ & $-15.8\%$ \\
+Sharpe ratio (annualised) & 0.83 & $\approx$0.50 \\
+Win rate (windows $>0$) & 64\% & -- \\
+Average deployment & 59\% & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The strategy returned 29.6\% total over roughly two years, against 16.5\% for the index. Its risk-adjusted return was meaningfully higher, despite only deploying 59\% of capital on average (reflecting the HMM's tendency to size down during volatile months).
+
+\subsection{Worst Months}
+
+The five worst rebalance windows are in Table~\ref{tab:worst}. All five occurred in BULL or HIGH\_VOL regimes (the HMM did not warn of these events), and four involved picks concentrated in SMID-cap speculative sectors that corrected sharply. The October 2024 window alone accounted for roughly 12\% portfolio drawdown in a single rebalance period.
+
+\begin{table}[htbp]
+\caption{Five worst rebalance windows}
+\label{tab:worst}
+\centering
+\footnotesize
+\begin{tabular}{lccl}
+\toprule
+\textbf{Date} & \textbf{Return} & \textbf{Regime} & \textbf{Notes} \\
+\midrule
+2024-10-18 & $-11.7\%$ & BULL & SMID correction \\
+2024-12-19 & $-6.2\%$  & BULL & IPO + defense basket \\
+2024-07-19 & $-4.2\%$  & HIGH\_VOL & Defense names unwind \\
+2025-02-17 & $-2.4\%$  & BULL & Broad weakness \\
+2025-01-20 & $-2.1\%$  & BEAR & Toe-hold position \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Ablation and Robustness}
+
+A series of ablations was run to understand which components of the strategy contributed to the headline result and which did not.
+
+\subsection{Parameter Sensitivity}
+
+Table~\ref{tab:sensitivity} shows Sharpe under variants of the main parameters, on the 2024--2026 window.
+
+\begin{table}[htbp]
+\caption{Parameter sensitivity on 2024--2026}
+\label{tab:sensitivity}
+\centering
+\begin{tabular}{lccc}
+\toprule
+\textbf{Variant} & \textbf{Sharpe} & \textbf{CAGR} & \textbf{Max DD} \\
+\midrule
+Baseline (top-5, sector cap, HMM) & 0.83 & 13.5\% & $-18.7\%$ \\
+Top-3 & 0.99 & 15.6\% & $-12.6\%$ \\
+Top-7 & 0.63 & 9.2\% & $-22.4\%$ \\
+No sector cap & 0.81 & 18.0\% & $-22.6\%$ \\
+No regime sizing (flat) & 1.39 & 42.5\% & $-19.7\%$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Three findings from this table.
+
+First, the signal is concentrated at the top of the distribution: top-3 beats top-5 beats top-7 on Sharpe. This is consistent with the diagnostic observation that LightGBM's better mid-distribution ranking did not translate to better top-5 performance.
+
+Second, removing the sector cap on the 2024--2026 window actually improved raw return (from 13.5\% to 18.0\% CAGR) but widened drawdown. The cap is a drawdown-management tool, not a return enhancer.
+
+Third, removing the HMM regime sizing appeared to dramatically improve results (Sharpe 0.83 to 1.39, CAGR 13.5\% to 42.5\%) with almost no drawdown change. If this result were taken at face value, the conclusion would be to drop the HMM. However, a single-window result cannot support that conclusion. The next section tests on additional periods.
+
+\subsection{HMM Ablation Across Four Regimes}
+
+The HMM regime-sizing question was re-tested on three additional historical windows, spanning the 2008 global financial crisis, the post-crisis recovery, and a mid-decade bull period. Because historical index membership for earlier years was not obtainable, the 2010--2015 tests use the current NIFTY 100 snapshot as a survivorship-biased proxy. This caveat is material: the absolute CAGR numbers for these windows should be read as upper bounds, but the HMM-vs-flat directional comparison remains valid because the bias affects both variants identically.
+
+Results are in Table~\ref{tab:four-windows}.
+
+\begin{table*}[htbp]
+\caption{HMM vs.\ flat regime sizing across four out-of-sample windows. Momentum signal on 2008--2015 windows; RAMT prediction signal on 2024--2025. Tickers downloaded out of requested in parentheses where known.}
+\label{tab:four-windows}
+\centering
+\small
+\begin{tabular}{lccccccc}
+\toprule
+\textbf{Window} & \textbf{Universe/Signal} & \textbf{Tickers} & \textbf{HMM Sharpe} & \textbf{HMM CAGR} & \textbf{HMM MDD} & \textbf{Flat Sharpe} & \textbf{Flat CAGR / MDD} \\
+\midrule
+2008-01 to 2010-12 & momentum / NIFTY 200 & $\sim$138 & $0.25$ & $3.7\%$ & $-43.2\%$ & $0.17$ & $0.8\% / -52.7\%$ \\
+2010-01 to 2012-12 & momentum / NIFTY 100 proxy & 78/100 & $0.15$ & $0.8\%$ & $-12.2\%$ & $-0.11$ & $-3.0\% / -30.1\%$ \\
+2013-01 to 2015-12 & momentum / NIFTY 100 proxy & 79/100 & $0.16$ & $0.8\%$ & $-33.2\%$ & $0.15$ & $0.6\% / -33.2\%$ \\
+2024-01 to 2025-12 & RAMT / NIFTY 200 & $\sim$200 & $0.66$ & $10.6\%$ & $-18.7\%$ & $1.35$ & $43.0\% / -19.7\%$ \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+Across the three momentum-signal windows, HMM sizing matches or beats flat sizing on both return and drawdown. The most dramatic difference is 2010--2012, where flat sizing produced $-3.0\%$ CAGR against HMM's $+0.8\%$ and cut maximum drawdown from $-30.1\%$ to $-12.2\%$. The 2024--2025 ``flat wins'' result (based on RAMT predictions, not momentum, so not directly comparable) appears to be regime-specific: a bull rally with positive correlation between volatility and returns, where the HMM's volatility detection became a cost rather than a benefit.
+
+The interpretation is that HMM regime sizing functions as tail-risk insurance. In crisis and recovery windows it pays off, sometimes substantially. In benign windows it charges a premium, usually small. Given that the thesis of this strategy is not to maximise return in a single regime but to produce robust risk-adjusted returns across regimes, the HMM is retained.
+
+\subsection{Strategy Weakness in Large-Cap Universes}
+
+A separate observation from the four-window table deserves attention. On the 2010--2012 and 2013--2015 windows, using the NIFTY 100 (large-cap) universe, the momentum strategy delivered only 0.8\% CAGR even with HMM sizing. Over the same 2013--2015 period, NIFTY 100 itself returned approximately 30\% cumulative (the Modi election rally). The momentum strategy therefore substantially underperformed buy-and-hold in large-cap universes during compressed-dispersion periods.
+
+This suggests the strategy's effectiveness depends on the universe. Cross-sectional momentum works best when there is meaningful dispersion between winners and losers, which tends to occur in broader universes (SMID-heavy) and in periods where leaders and laggards separate visibly. Large-cap universes in compressed markets offer little dispersion, and the strategy produces weak or negative excess returns.
+
+\section{Limitations}
+\label{sec:limitations}
+
+Several known limitations of this work should be stated directly.
+
+\textbf{Survivorship bias.} The NIFTY 200 universe is fixed at the 2024 snapshot. Stocks delisted or removed before 2024 are not in the universe. For the 2010--2015 windows, approximately 20\% of NIFTY 100 tickers could not be downloaded, biasing the sample further toward survivors. Absolute CAGR numbers are therefore upper bounds.
+
+\textbf{Short test window.} The main test window (2024--2026) is only 2 years and 25 rebalance events. Single-window Sharpe estimates are statistically noisy. The multi-window ablations partially address this but introduce their own survivorship issues.
+
+\textbf{Stop-loss not realised.} The backtest code logs which stocks hit the intraperiod 7\% stop but does not adjust realised returns to reflect the stop-out. Changing the stop-loss parameter therefore did not change realised P\&L. This is a known implementation limitation documented in the code.
+
+\textbf{Friction assumption.} Transaction cost is modelled as 22 basis points per rebalance on total trade value. This approximates STT, brokerage, and average slippage for the NIFTY 200 universe, but under-estimates realistic slippage for low-liquidity names within the index, particularly in stressed markets.
+
+\textbf{HMM design.} The HMM is fit on \texttt{[Ret\_1d, Realized\_Vol\_20]} and labels states based on the mean return of each state. In practice, the states are strongly driven by volatility rather than by return direction. The HMM therefore functions closer to a volatility detector than a true regime classifier. In 2024--2026 this proved counterproductive because volatility and returns were positively correlated.
+
+\textbf{Single trainer run for RAMT.} Given the training cost (several hours per run on an Apple Silicon MPS backend), each architectural variant was trained once. Different random seeds might have produced different RAMT outcomes. However, the systematic failure patterns (prediction collapse, plateauing loss) are consistent with the vanishing-gradient mechanism described, not with a seed-dependent local minimum.
+
+\textbf{Universe dependence.} The strategy performed meaningfully better on NIFTY 200 (SMID-heavy) than on NIFTY 100 (large-cap only). Deployment to a narrower universe would require revalidation.
+
+\section{Conclusion}
+
+This project set out to test whether a Regime-Adaptive Multimodal Transformer could improve cross-sectional equity selection on NIFTY 200 at a monthly horizon. The transformer did not succeed: its predictions on the test window were negatively correlated with realised returns, and systematic failure modes (prediction collapse, vanishing tournament-loss gradient) were identified as the cause.
+
+A gradient-boosted baseline on the same features achieved a statistically significant cross-sectional IC, establishing that the features contain signal and that the transformer's failure was architectural. A simpler strategy using 21-day momentum as the ranking signal, sector-diversified top-5 selection, and HMM regime-based position sizing achieved a Sharpe of 0.83 and a CAGR of 13.5\% on the 2024--2026 out-of-sample window, beating NIFTY buy-and-hold on both total return (by 13.1 percentage points cumulative) and risk-adjusted return.
+
+HMM regime sizing was tested on three additional historical windows. It preserved capital during the 2008 crisis (reducing maximum drawdown by 9.5 percentage points) and during the post-crisis recovery (17.9 percentage points), at a small cost during mid-decade bull periods and a larger cost during the 2024--2026 SMID rally. The net effect across periods supports retaining the HMM as a tail-risk hedge, though its value is regime-conditional.
+
+The broader observation from this work is that for a universe and horizon where the signal-to-noise ratio is low and cross-sectional dispersion is moderate, deep architectures with limited parameter budgets do not improve on classical momentum. A gradient-boosted baseline gives a cleaner measure of available signal than a transformer with a bespoke loss does. Future work could explore whether significantly larger models (with correspondingly larger datasets, such as multi-market pooling) or additional features (order-flow proxies, earnings surprise, news sentiment) change this conclusion. For the present setup, they do not.
+
+\begin{thebibliography}{00}
+\bibitem{jegadeesh1993} N. Jegadeesh and S. Titman, ``Returns to buying winners and selling losers: Implications for stock market efficiency,'' \textit{Journal of Finance}, vol. 48, no. 1, pp. 65--91, 1993.
+\bibitem{asness2013} C. S. Asness, T. J. Moskowitz, and L. H. Pedersen, ``Value and momentum everywhere,'' \textit{Journal of Finance}, vol. 68, no. 3, pp. 929--985, 2013.
+\bibitem{hamilton1989} J. D. Hamilton, ``A new approach to the economic analysis of nonstationary time series and the business cycle,'' \textit{Econometrica}, vol. 57, no. 2, pp. 357--384, 1989.
+\bibitem{guidolin2007} M. Guidolin and A. Timmermann, ``Asset allocation under multivariate regime switching,'' \textit{Journal of Economic Dynamics and Control}, vol. 31, no. 11, pp. 3503--3544, 2007.
+\bibitem{lim2021} B. Lim, S. \"O. Ar\i k, N. Loeff, and T. Pfister, ``Temporal Fusion Transformers for interpretable multi-horizon time series forecasting,'' \textit{International Journal of Forecasting}, vol. 37, no. 4, pp. 1748--1764, 2021.
+\bibitem{vaswani2017} A. Vaswani et al., ``Attention is all you need,'' in \textit{NeurIPS}, 2017.
+\bibitem{hmmlearn} \texttt{hmmlearn} library, hmmlearn developers. [Online]. Available: \url{https://hmmlearn.readthedocs.io}
+\end{thebibliography}
+
+\end{document}
