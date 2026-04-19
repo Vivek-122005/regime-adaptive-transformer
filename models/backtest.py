@@ -25,6 +25,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from features.sectors import get_sector
 
 REAL_2026_REBALANCE_FRICTION_RATE = 0.0022
 LEGACY_REBALANCE_FRICTION_RATE = 0.0020
@@ -209,6 +210,20 @@ def _load_price_series(raw_path: str) -> pd.Series:
     return s
 
 
+def _raw_ticker_stem(ticker: str) -> str:
+    """Match ``features.feature_engineering._safe_stem_from_ticker`` for ``data/raw/*.parquet`` names."""
+    return (
+        str(ticker)
+        .replace(".", "_")
+        .replace("^", "_")
+        .replace("=", "_")
+        .replace("/", "_")
+        .replace("&", "_")
+        .replace("-", "_")
+        .rstrip("_")
+    )
+
+
 def _period_return_from_prices(price_start: float, price_end: float) -> float:
     if not np.isfinite(price_start) or not np.isfinite(price_end) or abs(price_start) <= 1e-12:
         return 0.0
@@ -365,7 +380,7 @@ def run_backtest(
             raise ValueError("raw_dir is required to compute realized total returns from price history.")
         if ticker in price_cache:
             return price_cache[ticker]
-        path = raw_root / f"{ticker}.parquet"
+        path = raw_root / f"{_raw_ticker_stem(ticker)}.parquet"
         price_cache[ticker] = _load_price_series(str(path))
         return price_cache[ticker]
 
@@ -484,13 +499,50 @@ def run_backtest(
     return results_df
 
 
+def _sector_diversified_top_n(
+    month_df: pd.DataFrame,
+    n_sel: int,
+    score_col: str,
+) -> pd.DataFrame:
+    """
+    Pick up to ``n_sel`` names sorted by ``score_col``: prefer the top-ranked
+    name in each sector, then fill any remaining slots by overall rank (sectors may repeat).
+    """
+    if month_df.empty or n_sel <= 0:
+        return month_df.iloc[0:0].copy()
+    ranked = month_df.sort_values(score_col, ascending=False)
+    selected: list[pd.Series] = []
+    seen_sectors: set[str] = set()
+    seen_tickers: set[str] = set()
+    for _, row in ranked.iterrows():
+        if len(selected) >= n_sel:
+            break
+        t = str(row["Ticker"])
+        sec = get_sector(t)
+        if sec in seen_sectors:
+            continue
+        selected.append(row)
+        seen_sectors.add(sec)
+        seen_tickers.add(t)
+    if len(selected) < n_sel:
+        for _, row in ranked.iterrows():
+            if len(selected) >= n_sel:
+                break
+            t = str(row["Ticker"])
+            if t in seen_tickers:
+                continue
+            selected.append(row)
+            seen_tickers.add(t)
+    out = pd.DataFrame(selected).reset_index(drop=True)
+    return out
+
+
 def run_backtest_daily(
     predictions_df: pd.DataFrame,
     nifty_features_path: str,
     raw_dir: str,
     start: str,
     end: str,
-    step_size: int = 21,
     top_n: int = 5,
     capital: float = 100000,
     stop_loss: float = 0.07,
@@ -524,7 +576,9 @@ def run_backtest_daily(
     Kelly odds ``b`` come from the predicted-alpha margin each rebalance; otherwise
     ``kelly_b`` or the empirical win/loss ratio is used.
 
-    - Rebalance every `step_size` trading days on NIFTY calendar.
+    - Rebalance on each **unique prediction date** in ``predictions_df`` within
+      ``[start, end]`` (sorted). Windows run from each date to the next prediction
+      date — the same cadence as the ranking file, not a separate NIFTY stride grid.
     - **Friction:** each rebalance deducts ``rebalance_friction_rate`` (default **0.22%**)
       from **total trade value** = equity notional at rebalance, ``pv_start * invested``
       (STT + slippage combined; applied every window we deploy capital).
@@ -548,10 +602,13 @@ def run_backtest_daily(
 
     nifty_features_path = resolve_nifty_features_path(nifty_features_path, raw_dir)
 
-    nifty_raw = _load_nifty_benchmark_raw(raw_dir)
-    cal = pd.DatetimeIndex(nifty_raw["Date"])
-    cal = cal[(cal >= start_ts) & (cal <= end_ts)]
-    rebal = cal[::step_size]
+    rebal = (
+        preds["Date"]
+        .drop_duplicates()
+        .sort_values()
+    )
+    rebal = rebal[(rebal >= start_ts) & (rebal <= end_ts)]
+    rebal = pd.DatetimeIndex(rebal)
     if len(rebal) < 2:
         return pd.DataFrame()
 
@@ -564,7 +621,7 @@ def run_backtest_daily(
     def get_prices(ticker: str) -> pd.Series:
         if ticker in price_cache:
             return price_cache[ticker]
-        path = f"{raw_dir}/{ticker}.parquet"
+        path = f"{raw_dir}/{_raw_ticker_stem(ticker)}.parquet"
         price_cache[ticker] = _load_price_series(path)
         return price_cache[ticker]
 
@@ -630,9 +687,10 @@ def run_backtest_daily(
             month_df.loc[~month_df["Ticker"].isin(prev_holdings), "score_adj"] = (
                 month_df.loc[~month_df["Ticker"].isin(prev_holdings), "score_adj"] - turnover_penalty_score
             )
-            month_preds = month_df.nlargest(n_sel, "score_adj")
+            score_col = "score_adj"
         else:
-            month_preds = month_df.nlargest(n_sel, "predicted_alpha")
+            score_col = "predicted_alpha"
+        month_preds = _sector_diversified_top_n(month_df, n_sel, score_col)
         if month_preds.empty:
             results.append(
                 {

@@ -106,10 +106,12 @@ WARMUP_LR_START = 1e-7
 WARMUP_LR_END = 1e-4
 WEIGHT_DECAY = 1e-4
 MAX_EPOCHS = 30
-PATIENCE = 8
+PATIENCE = 5
 GRAD_CLIP = 1.0
 LAMBDA_DIR = 0.3
 NUM_HEADS = 8
+NUM_TRANSFORMER_LAYERS = 2
+NUM_EXPERTS = 1  # >1 enables full MixtureOfExperts (MoE)
 MODEL_DROPOUT = 0.2
 HIGH_VOL_SAMPLE_WEIGHT = 2.0  # regime 0
 # MarginRankingLoss margin: higher → model must separate leaders from the pack more aggressively.
@@ -118,10 +120,14 @@ RANKING_MARGIN = 3.0
 # --- Pessimism-bias fix (plan: eager-rolling-sphinx) -----------------------
 # See /Users/shivanshgupta/.claude/plans/eager-rolling-sphinx.md for the
 # mathematical defect summary that motivated these knobs.
-USE_TOURNAMENT_LOSS = True            # full-pairwise magnitude-weighted ranking
+USE_TOURNAMENT_LOSS = True            # magnitude-weighted pairwise ranking (see losses.TournamentRankingLoss)
 # Margin in unscaled monthly-alpha units (winsorized % space); paired with inverse-scaled preds.
 RANKING_MARGIN_ALPHA = 0.02
-AUX_DAILY_WEIGHT = 0.05               # tiny MSE anchor on daily head (was 0.3)
+# Subsample pairs per date: "random" ≈ O(max_pairs); "full" = exact O(N²); "top_bottom" = leaders vs laggards.
+TOURNAMENT_MAX_PAIRS = 500
+TOURNAMENT_PAIR_MODE = "random"  # "random" | "top_bottom" | "full"
+TOURNAMENT_TOP_BOTTOM_K = 10
+AUX_DAILY_WEIGHT = 0.2                # MSE anchor on daily head (tournament alone → near-zero preds)
 MIN_CROSSSECTION_SIZE = 8             # min stocks/date for ranking loss (was 4)
 
 # --- Sector-neutral scaling (plan: Upgrade 3 / D3) -------------------------
@@ -276,10 +282,23 @@ def _train_ramt_combined_fold(
         y_winsor_hi=hi_b,
     )
 
-    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=0)
+    _dl_kw = dict(num_workers=4, persistent_workers=True, pin_memory=True)
+    train_loader = DataLoader(
+        train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, **_dl_kw
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, **_dl_kw
+    )
 
-    model = build_ramt({"seq_len": SEQ_LEN, "num_heads": NUM_HEADS, "dropout": MODEL_DROPOUT}).to(DEVICE)
+    model = build_ramt(
+        {
+            "seq_len": SEQ_LEN,
+            "num_heads": NUM_HEADS,
+            "num_transformer_layers": NUM_TRANSFORMER_LAYERS,
+            "num_experts": NUM_EXPERTS,
+            "dropout": MODEL_DROPOUT,
+        }
+    ).to(DEVICE)
     criterion = CombinedLoss(lambda_dir=LAMBDA_DIR)
     optimizer = AdamW(model.parameters(), lr=WARMUP_LR_END, weight_decay=WEIGHT_DECAY)
     plateau = ReduceLROnPlateau(
@@ -716,7 +735,12 @@ def _lambdarank_loss(pred: torch.Tensor, y_true: torch.Tensor) -> torch.Tensor:
     return loss
 
 
-_TOURNAMENT = TournamentRankingLoss(margin=RANKING_MARGIN_ALPHA)
+_TOURNAMENT = TournamentRankingLoss(
+    margin=RANKING_MARGIN_ALPHA,
+    max_pairs=TOURNAMENT_MAX_PAIRS,
+    pair_mode=TOURNAMENT_PAIR_MODE,
+    top_bottom_k=TOURNAMENT_TOP_BOTTOM_K,
+)
 
 
 def _monthly_pred_unscaled(pred_m: torch.Tensor, y_scaler: RobustScaler) -> torch.Tensor:
@@ -1042,6 +1066,8 @@ def save_ramt_inference_artifacts(
         "config": {
             "seq_len": SEQ_LEN,
             "num_heads": NUM_HEADS,
+            "num_transformer_layers": NUM_TRANSFORMER_LAYERS,
+            "num_experts": NUM_EXPERTS,
             "dropout": MODEL_DROPOUT,
         },
         "train_start": str(train_start),
@@ -1078,7 +1104,7 @@ def combined_walk_forward(
     start: str = "2016-01-01",
     end: str = "2024-12-31",
     test_steps: int = 3,
-    training_step: int = 126,
+    training_step: int = 252,
     rebalance_step: int = 21,
     step_size: int | None = None,
     inference_warmup_days: int = 30,
@@ -1089,7 +1115,7 @@ def combined_walk_forward(
     """
     Combined RAMT with **decoupled** walk-forward training vs inference cadence.
 
-    - **training_step** (default 126 trading days ≈ 6 months): retrain the model each time
+    - **training_step** (default 252 trading days ≈ 1 year): retrain the model each time
       the out-of-sample calendar advances by this step. Training uses all history strictly
       before the first prediction date of that segment (expanding window; after the first
       segment, labels from realized test months are included — standard production-style WF).
@@ -1103,7 +1129,7 @@ def combined_walk_forward(
     if step_size is not None:
         rebalance_step = int(step_size)
 
-    store = LazyTickerStore("data/processed", cache_size=6)
+    store = LazyTickerStore("data/processed", cache_size=200)
     tickers = list(TICKERS)
     if not tickers:
         raise FileNotFoundError("No processed parquet feature files found under data/processed.")
@@ -1111,7 +1137,7 @@ def combined_walk_forward(
     nifty_path = _nifty_raw_path()
     full_cal = _full_nifty_trading_calendar(nifty_path)
 
-    # Outer calendar: 6-month (126d) test segments; inner: 21d predictions per segment.
+    # Outer calendar: yearly (252d) retrain segments; inner: 21d predictions per segment.
     segment_starts = _rebalance_dates_21d(
         nifty_path, TEST_START, TEST_END, step_size=int(training_step)
     )
@@ -1329,7 +1355,15 @@ def train_fixed_and_predict(
     train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False, num_workers=2)
     val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False, num_workers=2)
 
-    model = build_ramt({"seq_len": SEQ_LEN, "num_heads": NUM_HEADS, "dropout": MODEL_DROPOUT}).to(DEVICE)
+    model = build_ramt(
+        {
+            "seq_len": SEQ_LEN,
+            "num_heads": NUM_HEADS,
+            "num_transformer_layers": NUM_TRANSFORMER_LAYERS,
+            "num_experts": NUM_EXPERTS,
+            "dropout": MODEL_DROPOUT,
+        }
+    ).to(DEVICE)
     criterion = CombinedLoss(lambda_dir=LAMBDA_DIR)
     optimizer = AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 

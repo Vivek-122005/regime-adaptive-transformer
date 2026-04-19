@@ -4,12 +4,13 @@ RAMT — Full Model Architecture
 Complete forward pass:
 1. MultimodalEncoder  → (batch, seq_len, 64)
 2. PositionalEncoding → (batch, seq_len, 64)
-3. MixtureOfExperts   → (batch, embed_dim) context embedding
-                        (batch, 3) gate weights
+3. Transformer stack  → (batch, embed_dim) context embedding
+   (MixtureOfExperts if num_experts>1, else SingleExpertBackbone)
+                        (batch, num_experts) gate weights (or ones if single expert)
 
 Regime conditioning flows through:
 - RegimeEncoder in MultimodalEncoder
-- GatingNetwork in MixtureOfExperts
+- RegimeCrossAttention (+ GatingNetwork only when num_experts>1)
 Both use the same HMM_Regime signal.
 """
 
@@ -18,7 +19,12 @@ import torch.nn as nn
 
 from models.ramt.dataset import ALL_FEATURE_COLS
 from models.ramt.encoder import MultimodalEncoder
-from models.ramt.moe import MixtureOfExperts, PositionalEncoding, RegimeCrossAttention
+from models.ramt.moe import (
+    MixtureOfExperts,
+    PositionalEncoding,
+    RegimeCrossAttention,
+    SingleExpertBackbone,
+)
 
 
 class RAMTModel(nn.Module):
@@ -40,26 +46,26 @@ class RAMTModel(nn.Module):
       Day 1 vs Day 30 become distinguishable
       Still (batch, seq_len, embed_dim=64)
 
-    Step 3 — MixtureOfExperts:
-      3 Transformer experts process the sequence
-      GatingNetwork blends based on regime
+    Step 3 — Transformer backbone:
+      If num_experts==1: one Transformer encoder (no MoE routing).
+      Else: MixtureOfExperts — multiple experts + gating.
       Output: (batch, embed_dim) context embedding
-              (batch, 3) gate weights
+              (batch, num_experts) gate weights
 
     Step 4 — Dual heads ("dual-brain"):
       Monthly head: predict Monthly_Alpha / Monthly_Alpha_Z (ranking signal)
       Daily head:   predict next-day Log_Return (sanity-check signal)
 
     Output: prediction (batch, 1)
-            gate_weights (batch, 3) — for interpretability
+            gate_weights (batch, num_experts)
 
     Args:
         embed_dim: unified embedding dimension (default 64)
         group_dim: per-group encoder output dim (default 32)
-        num_heads: attention heads in Transformer (default 4)
-        num_transformer_layers: layers per expert (default 2)
+        num_heads: attention heads in Transformer (default 8)
+        num_transformer_layers: Transformer encoder depth (default 2)
         dim_feedforward: feedforward size in Transformer (default 128)
-        num_experts: number of MoE experts (default 3)
+        num_experts: MoE experts; 1 uses a single Transformer (default 1)
         num_regimes: number of HMM regimes (default 3)
         seq_len: input sequence length (default 30)
         dropout: dropout rate (default 0.1)
@@ -69,10 +75,10 @@ class RAMTModel(nn.Module):
         self,
         embed_dim=64,
         group_dim=32,
-        num_heads=4,
+        num_heads=8,
         num_transformer_layers=2,
         dim_feedforward=128,
-        num_experts=3,
+        num_experts=1,
         num_regimes=3,
         seq_len=30,
         dropout=0.1,
@@ -104,17 +110,27 @@ class RAMTModel(nn.Module):
             dropout=dropout,
         )
 
-        # Step 3: Mixture of Experts (returns fused context embedding)
-        self.moe = MixtureOfExperts(
-            embed_dim=embed_dim,
-            num_heads=num_heads,
-            num_layers=num_transformer_layers,
-            dim_feedforward=dim_feedforward,
-            num_experts=num_experts,
-            num_regimes=num_regimes,
-            dropout=dropout,
-            explainable_attn=explainable_attn,
-        )
+        # Step 3: Transformer backbone (single stack or full MoE)
+        if num_experts <= 1:
+            self.moe = SingleExpertBackbone(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_layers=num_transformer_layers,
+                dim_feedforward=dim_feedforward,
+                dropout=dropout,
+                explainable_attn=explainable_attn,
+            )
+        else:
+            self.moe = MixtureOfExperts(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_layers=num_transformer_layers,
+                dim_feedforward=dim_feedforward,
+                num_experts=num_experts,
+                num_regimes=num_regimes,
+                dropout=dropout,
+                explainable_attn=explainable_attn,
+            )
 
         # Step 4: Dual heads
         head_hidden = embed_dim // 2
@@ -143,7 +159,7 @@ class RAMTModel(nn.Module):
 
         Returns:
             prediction:   (batch, 1) next-day return prediction
-            gate_weights: (batch, num_experts) for analysis
+            gate_weights: (batch, num_experts); all-ones when num_experts==1
         """
         # Step 1: Encode each feature group separately
         # then fuse into unified representation
@@ -157,7 +173,7 @@ class RAMTModel(nn.Module):
 
         positioned = self.regime_attn(positioned, regime)
 
-        # Step 3: Route through regime-specialized experts -> context embedding
+        # Step 3: Transformer context embedding (MoE blend or single stack)
         context, gate_weights = self.moe(positioned, regime)
         # context: (batch, embed_dim)
         # gate_weights: (batch, num_experts)
@@ -178,17 +194,17 @@ def build_ramt(config=None):
     Uses defaults from PHASE2_PLAN.md if no config provided.
 
     Default config:
-        embed_dim=64, group_dim=32, num_heads=4,
+        embed_dim=64, group_dim=32, num_heads=8,
         num_transformer_layers=2, dim_feedforward=128,
-        num_experts=3, num_regimes=3, seq_len=30, dropout=0.1
+        num_experts=1, num_regimes=3, seq_len=30, dropout=0.1
     """
     defaults = {
         "embed_dim": 64,
         "group_dim": 32,
-        "num_heads": 4,
+        "num_heads": 8,
         "num_transformer_layers": 2,
         "dim_feedforward": 128,
-        "num_experts": 3,
+        "num_experts": 1,
         "num_regimes": 3,
         "seq_len": 30,
         "dropout": 0.1,
@@ -216,7 +232,7 @@ if __name__ == "__main__":
     moe_params = sum(p.numel() for p in model.moe.parameters())
     print(f"  Encoder:            {enc_params:,}")
     print(f"  PositionalEncoding: {pos_params:,}")
-    print(f"  MoE:                {moe_params:,}")
+    print(f"  Transformer backbone: {moe_params:,}")
 
     # Test forward pass with random data
     print("\n--- Test 1: Forward Pass (random data) ---")
@@ -235,8 +251,8 @@ if __name__ == "__main__":
     assert pred_d.shape == (batch_size, 1), (
         f"Expected ({batch_size}, 1) got {pred_d.shape}"
     )
-    assert weights.shape == (batch_size, 3), (
-        f"Expected ({batch_size}, 3) got {weights.shape}"
+    assert weights.shape == (batch_size, 1), (
+        f"Expected ({batch_size}, 1) gate weights, got {weights.shape}"
     )
     assert not torch.isnan(pred_m).any(), "NaN in predictions!"
     assert not torch.isnan(weights).any(), "NaN in gate weights!"
@@ -268,15 +284,12 @@ if __name__ == "__main__":
     print(f"Real input shape:  {X_batch.shape}")
     print(f"Real pred shape:   {pred_m_real.shape}")
     print(f"Regime values:     {r_batch.tolist()[:8]}")
-    print("Gate weights sample:")
-    for i in range(3):
+    print("Gate weights sample (single expert = 1.0):")
+    for i in range(min(3, int(X_batch.size(0)))):
         w = weights_real[i].tolist()
         r = r_batch[i].item()
         name = ["HighVol", "Bull", "Bear"][r]
-        print(
-            f"  {name}: HV={w[0]:.3f} "
-            f"Bull={w[1]:.3f} Bear={w[2]:.3f}"
-        )
+        print(f"  {name}: w={w}")
     print("Real Data Test: PASSED")
 
     # Test loss function

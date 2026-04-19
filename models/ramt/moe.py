@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -143,6 +145,52 @@ class ExpertTransformer(nn.Module):
             if w is not None:
                 out.append(w)
         return out
+
+
+class SingleExpertBackbone(nn.Module):
+    """
+    Single Transformer encoder stack with no MoE routing.
+
+    Regime is already injected via MultimodalEncoder + RegimeCrossAttention upstream;
+    this module only runs one expert (same API as MixtureOfExperts for RAMTModel).
+    Gate weights are returned as ones (batch, 1) for downstream compatibility.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 64,
+        num_heads: int = 4,
+        num_layers: int = 1,
+        dim_feedforward: int = 128,
+        dropout: float = 0.1,
+        explainable_attn: bool = False,
+    ):
+        super().__init__()
+        self.expert = ExpertTransformer(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            dim_feedforward=dim_feedforward,
+            dropout=dropout,
+            explainable_attn=explainable_attn,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        regime: torch.Tensor,
+        gating_context: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        del regime, gating_context  # regime handled before this block
+        ctx = self.expert(x)
+        b = x.size(0)
+        gate_weights = torch.ones(b, 1, device=x.device, dtype=x.dtype)
+        return ctx, gate_weights
+
+    def get_last_attention(self) -> list[list[torch.Tensor]]:
+        if not self.expert.explainable_attn:
+            return []
+        return [self.expert.get_last_attn_stack()]
 
 
 class RegimeCrossAttention(nn.Module):

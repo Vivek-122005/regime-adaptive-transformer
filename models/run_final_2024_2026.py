@@ -4,7 +4,7 @@ Final split runner (no future leakage)
 Train: 2020-01-01 … 2022-12-31 (history used to fit scalers + model).
 Blind test / backtest: 2024-01-01 … 2026-04-16 (held out from scaler fitting).
 
-Walk-forward: **retrain** every ``training_step`` (default 126 trading days ≈ 6 months);
+Walk-forward: **retrain** every ``training_step`` (default 252 trading days ≈ 1 year);
 **inference / portfolio rebalance** every ``rebalance_step`` (default 21 days). Inference
 uses a 30-day warm-up requirement beyond the model sequence length for stable indicators.
 
@@ -32,6 +32,7 @@ sys.path.append(str(ROOT))
 
 from models.backtest import run_backtest_daily  # noqa: E402
 from models.ramt import train_ranking as tr  # noqa: E402
+from features.feature_engineering import _safe_stem_from_ticker  # noqa: E402
 
 
 def add_momentum_column(rankings: pd.DataFrame) -> pd.DataFrame:
@@ -50,7 +51,8 @@ def add_momentum_column(rankings: pd.DataFrame) -> pd.DataFrame:
         d = pd.to_datetime(row["Date"])
         t = row["Ticker"]
         if t not in cache:
-            p = ROOT / "data/processed" / f"{t}_features.parquet"
+            stem = _safe_stem_from_ticker(str(t))
+            p = ROOT / "data/processed" / f"{stem}_features.parquet"
             df = pd.read_parquet(p)
             df["Date"] = pd.to_datetime(df["Date"])
             df = df.sort_values("Date").set_index("Date")
@@ -80,8 +82,8 @@ def main() -> None:
     parser.add_argument(
         "--training-step",
         type=int,
-        default=126,
-        help="Walk-forward retrain cadence in trading days (~6 months). Default: 126",
+        default=252,
+        help="Walk-forward retrain cadence in trading days (~1 year). Default: 252",
     )
     parser.add_argument(
         "--rebalance-step",
@@ -151,8 +153,8 @@ def main() -> None:
         print(f"Loading predictions (no training): {preds_path.resolve()}", flush=True)
         rs = args.rebalance_step if args.step_size is None else int(args.step_size)
         print(
-            f"Using rebalance_step={rs} for backtest — match the step used when "
-            f"ranking_predictions.csv was generated.",
+            f"Backtest uses unique dates in this file (cadence follows training "
+            f"rebalance_step={rs} used when the CSV was built).",
             flush=True,
         )
         preds = pd.read_csv(preds_path)
@@ -198,14 +200,12 @@ def main() -> None:
     print(f"Saved: {rankings_out}", flush=True)
 
     print("Running daily-price backtest with risk rules...", flush=True)
-    bt_step = int(args.rebalance_step) if args.step_size is None else int(args.step_size)
     bt = run_backtest_daily(
         predictions_df=preds[preds["Period"] == "Test"][["Date", "Ticker", "predicted_alpha", "actual_alpha"]],
         nifty_features_path=str(ROOT / "data/processed/_NSEI_features.parquet"),
         raw_dir=str(ROOT / "data/raw"),
         start=test_start,
         end=test_end,
-        step_size=bt_step,
         top_n=5,
         capital=100000,
         stop_loss=0.07,
