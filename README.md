@@ -20,15 +20,37 @@ The project has evolved into a **Foundation-Hybrid** architecture, combining thr
 # 1) Install dependencies + run setup
 ./setup.sh
 
-# 2) Run full diagnostic ablation study (Momentum vs. Chronos vs. Hybrid)
+# 2) Run Momentum + HMM Strategy (Production Strategy)
+python main.py --task momentum
+
+# 3) Run full diagnostic ablation study (Momentum vs. Chronos vs. Hybrid)
 python main.py --mode diagnostic
 
-# 3) Run Foundation Model Explainability (Feature Importance)
+# 4) Run Foundation Model Explainability (Feature Importance)
 python main.py --task explain
 
-# 4) Launch Enhanced Interactive Dashboard
+# 5) Launch Enhanced Interactive Dashboard
 streamlit run dashboard/app.py
 ```
+
+### Momentum Strategy Direct Command
+
+For the production **Regime-Adaptive Momentum Strategy** (21-day momentum + HMM position sizing):
+
+```bash
+# Single command to run the complete momentum + HMM strategy
+python main.py --task momentum
+
+# Or run the strategy class directly
+python -c "from models.momentum_hmm_strategy import main; main()"
+```
+
+This command:
+- Generates 21-day momentum signals for NIFTY 200 stocks
+- Detects market regimes using 3-state HMM (Bull/High-Vol/Bear)
+- Applies regime-based position sizing (100%/50%/20% allocation)
+- Runs realistic backtest with 0.22% friction and stop-losses
+- Outputs performance results to `results/momentum_hmm_backtest.csv`
 
 For containerized runs:
 ```bash
@@ -161,6 +183,15 @@ The last row is what `results/final_strategy/backtest_results.csv` represents to
 - `features/feature_engineering.py` — build the panel features, alphas, and benchmark alignment.
 - `features/sectors.py` — hand mapping from ticker to sector for the sector cap.
 
+**Production Momentum + HMM Strategy**
+
+- `models/momentum_hmm_strategy.py` — **Unified Regime-Adaptive Momentum Strategy** (single source of truth).
+  - 21-day momentum signal generation
+  - 3-state HMM regime detection (Bull/High-Vol/Bear)
+  - Regime-based position sizing (100%/50%/20% allocation)
+  - Complete backtesting with realistic friction and stops
+  - Run with: `python main.py --task momentum`
+
 **Model (kept for thesis ablation, not the live signal)**
 
 - `models/ramt/model.py` — RAMT module definitions.
@@ -215,13 +246,10 @@ python features/feature_engineering.py
 # 2. Run the baseline diagnostic (the thing that motivated the pivot)
 python scripts/baseline_feature_ic.py
 
-# 3. Build the momentum predictions CSV
-python scripts/build_momentum_predictions.py
+# 3. Run the unified momentum + HMM strategy
+python main.py --task momentum
 
-# 4. Run the backtest
-python models/run_final_2024_2026.py --backtest-only
-
-# 5. Launch the dashboard
+# 4. Launch the dashboard
 streamlit run dashboard/app.py
 ```
 

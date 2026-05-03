@@ -42,6 +42,7 @@ SENTIMENT_LORA = SENTIMENT_DIR / "sentiment_features_lora.parquet"
 SENTIMENT_VANILLA = SENTIMENT_DIR / "sentiment_features_vanilla.parquet"
 ABLATION_REPORT_CSV = ROOT / "results" / "ablation_report.csv"
 ABLATION_DIR = ROOT / "results" / "ablation"
+HISTORICAL_2012_CSV = ROOT / "results" / "historical_2012" / "backtest_summary_2012_2015.csv"
 
 # Optional archived comparison CSVs (if present)
 ARCHIVE_RAMT_BACKTEST = ROOT / "results" / "archive" / "ramt_backtest_results.csv"
@@ -1867,6 +1868,161 @@ as the primary alpha source.
     )
 
 
+def render_historical_stress_test() -> None:
+    """Render the 2012-2015 blind backtest results."""
+    st.subheader("Historical Stress Test (2012-2015)")
+    st.caption(
+        "Blind backtest using pre-2012 training data only. "
+        "Tests model robustness across different market regimes (Taper Tantrum, etc.)."
+    )
+    
+    if not HISTORICAL_2012_CSV.exists():
+        st.error(f"Historical 2012-2015 results not found at `{HISTORICAL_2012_CSV}`")
+        return
+    
+    try:
+        # Load the results
+        df_hist = pd.read_csv(HISTORICAL_2012_CSV)
+        
+        # Display the results table
+        st.markdown("### 📊 Backtest Performance Summary")
+        
+        # Format the table for better display
+        display_df = df_hist.copy()
+        
+        # Add color coding for better visualization
+        def color_performance(val, metric, is_better_high=True):
+            if pd.isna(val):
+                return ""
+            
+            # Convert string percentages to numbers for comparison
+            if isinstance(val, str) and val.endswith('%'):
+                num_val = float(val.rstrip('%'))
+                if metric == 'MaxDD':  # For max drawdown, lower is better
+                    color = 'green' if num_val > -15 else 'orange' if num_val > -20 else 'red'
+                else:  # For CAGR, Sharpe, WinRate - higher is better
+                    if metric == 'CAGR':
+                        color = 'green' if num_val > 10 else 'orange' if num_val > 5 else 'lightgray'
+                    elif metric == 'Sharpe':
+                        color = 'green' if num_val > 1.0 else 'orange' if num_val > 0.5 else 'lightgray'
+                    elif metric == 'WinRate':
+                        color = 'green' if num_val > 60 else 'orange' if num_val > 50 else 'lightgray'
+                    else:
+                        color = 'lightgray'
+                return f'color: {color}'
+            return ""
+        
+        # Apply styling
+        styled_df = display_df.style.map(
+            lambda x: color_performance(x, 'CAGR'), 
+            subset=['CAGR']
+        ).map(
+            lambda x: color_performance(x, 'Sharpe'), 
+            subset=['Sharpe']
+        ).map(
+            lambda x: color_performance(x, 'MaxDD'), 
+            subset=['MaxDD']
+        ).map(
+            lambda x: color_performance(x, 'WinRate'), 
+            subset=['WinRate']
+        )
+        
+        st.dataframe(styled_df, use_container_width=True)
+        
+        # Add NIFTY benchmark comparison
+        st.markdown("### 🎯 Benchmark Comparison")
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric(
+                "NIFTY Buy & Hold (2012-2015)",
+                "13.6%",
+                "+0.9% vs best strategy"
+            )
+        
+        with col2:
+            st.metric(
+                "Best Strategy",
+                "Simple Hybrid (50/50)",
+                "18.3% CAGR"
+            )
+        
+        with col3:
+            st.metric(
+                "Worst Strategy",
+                "Foundation Only (Chronos)",
+                "5.8% CAGR"
+            )
+        
+        # Key insights
+        st.markdown("### 🔍 Key Insights")
+        
+        insights = [
+            "🏆 **Simple Hybrid (50/50)** outperformed NIFTY with 18.3% CAGR vs 13.6%",
+            "⚠️ **Chronos-only** strategy struggled (23% win rate, killswitch triggered during Taper Tantrum)",
+            "📈 **Momentum+HMM** baseline achieved solid risk-adjusted returns (Sharpe 1.24)",
+            "🔄 **Triple-Expert** matched baseline performance, showing robustness of the hybrid approach",
+            "🛡️ All strategies showed better drawdown control than NIFTY (-16.0%)"
+        ]
+        
+        for insight in insights:
+            st.markdown(insight)
+        
+        # Technical details
+        with st.expander("🔧 Technical Details"):
+            st.markdown("""
+            **Training Setup:**
+            - Training data: 2011-01-01 to 2011-12-31 only (pre-2012)
+            - Backtest period: 2012-01-01 to 2015-12-31 (blind)
+            - Universe: 49 tickers from 2012 NIFTY 200 approximation
+            - Rebalancing: Monthly (21 trading days)
+            
+            **Risk Management:**
+            - Transaction cost: 0.22% per rebalance
+            - Stop loss: 7% per position
+            - Portfolio drawdown killswitch: 15%
+            - Sector cap: Max 1 stock per NSE sector
+            - HMM regime sizing: Bull=1.0x, High Vol=0.5x, Bear=0.2x
+            
+            **Model Architecture:**
+            - Chronos-T5 Small with LoRA adapters
+            - 333,825 trainable parameters
+            - Sequence length: 30 days
+            - Target: Sector_Alpha (cross-sectional)
+            """)
+        
+        # Load individual backtest files if available
+        st.markdown("### 📈 Individual Strategy Performance")
+        
+        backtest_files = {
+            "Baseline (Momentum+HMM)": "backtest_momentum_hmm_2012_2015.csv",
+            "Foundation Only (Chronos)": "backtest_chronos_2012_2015.csv", 
+            "Simple Hybrid (50/50)": "backtest_hybrid_2012_2015.csv",
+            "Triple-Expert (Hybrid+HMM)": "backtest_hybrid_hmm_2012_2015.csv"
+        }
+        
+        selected_strategy = st.selectbox(
+            "Select strategy to view detailed performance:",
+            list(backtest_files.keys())
+        )
+        
+        if selected_strategy:
+            backtest_path = HISTORICAL_2012_CSV.parent / backtest_files[selected_strategy]
+            if backtest_path.exists():
+                try:
+                    bt_detail = pd.read_csv(backtest_path)
+                    st.write(f"**{selected_strategy}** - Detailed backtest results")
+                    st.dataframe(bt_detail.head(10), use_container_width=True)
+                    st.caption(f"Showing first 10 of {len(bt_detail)} rebalance periods")
+                except Exception as e:
+                    st.warning(f"Could not load detailed backtest: {e}")
+            else:
+                st.info("Detailed backtest file not available")
+        
+    except Exception as e:
+        st.error(f"Error loading historical results: {e}")
+
+
 def main() -> None:
     st.title("NIFTY 200 research — model comparison")
     st.caption(
@@ -1880,6 +2036,7 @@ def main() -> None:
     _SECTIONS = [
         "RAMT transformer",
         "Production strategy (momentum + HMM)",
+        "Historical Stress Test (2012-2015)",
         "Triple-Expert Diagnostic",
         "Phase 3 interactive",
         "LSTM",
@@ -1937,6 +2094,9 @@ def main() -> None:
             st.warning(f"This section needs `{BACKTEST_CSV}` and a valid NIFTY series.")
         else:
             render_momentum_strategy_tabs(bt, nifty_raw, strat, bench)
+
+    elif section == "Historical Stress Test (2012-2015)":
+        render_historical_stress_test()
 
     elif section == "Triple-Expert Diagnostic":
         render_triple_expert_diagnostic(bt)

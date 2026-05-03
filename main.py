@@ -41,7 +41,7 @@ def main() -> None:
         "--task",
         type=str,
         required=False,
-        choices=["all", "data", "sentiment", "validate", "ablation", "diagnostic", "diagram", "explain", "smoke-test"],
+        choices=["all", "data", "sentiment", "validate", "ablation", "diagnostic", "diagram", "explain", "momentum", "smoke-test"],
         help="Execution task (preferred).",
     )
     parser.add_argument(
@@ -128,8 +128,9 @@ def main() -> None:
         _run([sys.executable, "scripts/generate_architecture_diagram.py"])
         return
 
-    if task == "explain":
-        _run([sys.executable, "scripts/explain_sentiment.py", "--config", args.config])
+    if task == "momentum":
+        _run([sys.executable, "-c", 
+              "from backtest.core.momentum_hmm_strategy import main; main()"])
         return
 
     if task == "all":
