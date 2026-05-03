@@ -17,8 +17,8 @@ checkpoints/*.pt
 checkpoints/*.joblib
 !checkpoints/.gitkeep
 
-# All .pt files (too large for git)
-*.pt
+# Oversized historical backtest artifact; keep model checkpoints tracked via Git LFS.
+results/backtesting/historical_2012/chronos_v2_adapter_pre2012.pt
 
 # Jupyter
 .ipynb_checkpoints/
