@@ -22,9 +22,10 @@ for all tickers in the test set so that the dashboard and backtester can access 
 
 DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
 SEQ_LEN = 30
-TEST_START = "2024-01-01"
+TEST_START = "2012-01-01"
+TEST_END = "2015-12-31"
 
-def generate_predictions():
+def generate_predictions(start_date: str = TEST_START, end_date: str = TEST_END, suffix: str = "2012_2015"):
     print("🚀 Generating Chronos-T5 LoRA V2 Predictions...")
     
     # Load Model
@@ -50,8 +51,8 @@ def generate_predictions():
         df["Date"] = pd.to_datetime(df["Date"])
         df = df.sort_values("Date")
         
-        # We only need test set dates
-        test_df = df[df["Date"] >= pd.to_datetime(TEST_START)].copy()
+        # Filter for the specific test window
+        test_df = df[(df["Date"] >= pd.to_datetime(start_date)) & (df["Date"] <= pd.to_datetime(end_date))].copy()
         if test_df.empty: continue
         
         # Get start index in original df
@@ -62,6 +63,10 @@ def generate_predictions():
         for i in range(start_idx, len(df)):
             if i < SEQ_LEN: continue
             
+            # Stop if we exceed end_date
+            if df.iloc[i]["Date"] > pd.to_datetime(end_date):
+                break
+
             x = torch.tensor(feats[i-SEQ_LEN:i]).unsqueeze(0).to(DEVICE)
             with torch.no_grad():
                 pred = model(x).item()
@@ -74,10 +79,17 @@ def generate_predictions():
             })
             
     out_df = pd.DataFrame(all_preds)
-    out_path = ROOT / "results" / "lora" / "lora_v2_predictions.csv"
+    out_path = ROOT / "results" / "lora" / f"lora_v2_predictions_{suffix}.csv"
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_df.to_csv(out_path, index=False)
     print(f"✅ Predictions saved to {out_path}")
 
 if __name__ == "__main__":
-    generate_predictions()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--start", type=str, default="2012-01-01")
+    parser.add_argument("--end", type=str, default="2015-12-31")
+    parser.add_argument("--suffix", type=str, default="2012_2015")
+    args = parser.parse_args()
+    
+    generate_predictions(start_date=args.start, end_date=args.end, suffix=args.suffix)

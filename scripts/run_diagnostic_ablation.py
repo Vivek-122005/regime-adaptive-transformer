@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import argparse
 import sys
 from pathlib import Path
 import pandas as pd
@@ -14,14 +15,20 @@ from models.ablation_engine import compute_metrics
 
 def run_diagnostic_study():
     print("🚀 Starting 4-Way Diagnostic Ablation Study...")
+
+    parser = argparse.ArgumentParser(description="Run the diagnostic ablation study")
+    parser.add_argument("--start", type=str, default="2024-01-01", help="Start date for the backtest window")
+    parser.add_argument("--end", type=str, default="2026-04-15", help="End date for the backtest window")
+    parser.add_argument("--suffix", type=str, default="", help="Optional suffix for the output filename")
+    args = parser.parse_args()
     
     processed_dir = ROOT / "data" / "processed"
     chronos_preds = ROOT / "results" / "lora" / "lora_predictions.csv"
     nifty_features = ROOT / "data" / "processed" / "_NSEI_features.parquet"
     raw_dir = ROOT / "data" / "raw"
     
-    start_date = "2024-01-01"
-    end_date = "2026-04-15"
+    start_date = args.start
+    end_date = args.end
     
     scenarios = [
         ("Baseline (ML): Momentum + HMM", "baseline"),
@@ -73,7 +80,8 @@ def run_diagnostic_study():
     print("="*80)
 
     # Save Results
-    output_path = ROOT / "results" / "ablation_summary.json"
+    suffix = f"_{args.suffix}" if args.suffix else ""
+    output_path = ROOT / f"results/ablation_summary{suffix}.json"
     report_df.to_json(output_path, orient='records', indent=4)
     print(f"\nDetailed report saved to {output_path}")
 

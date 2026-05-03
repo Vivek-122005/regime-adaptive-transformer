@@ -282,6 +282,7 @@ def process_raw_equity_path(
     nifty_df: pd.DataFrame,
     macro_data: dict[str, pd.DataFrame],
     processed_dir: Path,
+    cutoff_date: str = None,
 ) -> tuple[str, Path] | tuple[str, None]:
     """
     Read one raw file, compute features, write ``{{stem}}_features.parquet``.
@@ -314,13 +315,19 @@ def process_raw_equity_path(
         print(f"Skipping {ticker}: 0 rows after dropping rows without Monthly_Alpha (n_orig={n_orig})")
         return ticker, None
 
+    # Clip to cutoff_date if specified
+    if cutoff_date is not None:
+        cutoff_ts = pd.Timestamp(cutoff_date)
+        out = out[out["Date"] <= cutoff_ts].copy()
+        print(f"[{ticker}] clipped to <= {cutoff_date}: {len(out)} rows")
+    
     out_path = processed_dir / f"{_safe_stem_from_ticker(ticker)}_features.parquet"
     out.to_parquet(out_path, index=False)
     print(f"[{ticker}] rows: {n_orig} original → {len(out)} after dropna → saved {out_path.name}")
     return ticker, out_path
 
 
-def _download_benchmark_if_missing() -> Path:
+def _download_benchmark_if_missing(cutoff_date: str = None) -> Path:
     if NIFTY_BENCHMARK_PARQUET.exists():
         return NIFTY_BENCHMARK_PARQUET
 
@@ -328,11 +335,23 @@ def _download_benchmark_if_missing() -> Path:
     if csv_alt.exists():
         return csv_alt
 
+    # Adjust download dates for cutoff date
+    download_start = START_DATE
+    download_end = END_DATE_EXCLUSIVE
+    
+    if cutoff_date is not None:
+        download_start = START_DATE  # Keep original start for rolling windows
+        cutoff_ts = pd.Timestamp(cutoff_date)
+        # Add 30 calendar days buffer for forward-looking targets
+        buffer_end = cutoff_ts + pd.Timedelta(days=30)
+        download_end = buffer_end.strftime("%Y-%m-%d")
+        print(f"Downloading benchmark with cutoff {cutoff_date}: {download_start} to {download_end}")
+
     print(f"Benchmark parquet missing; downloading {NIFTY_BENCHMARK_TICKER} …")
     data = yf.download(
         NIFTY_BENCHMARK_TICKER,
-        start=START_DATE,
-        end=END_DATE_EXCLUSIVE,
+        start=download_start,
+        end=download_end,
         interval="1d",
         auto_adjust=False,
         actions=False,
@@ -631,7 +650,7 @@ def compute_monthly_alpha_adjclose(df: pd.DataFrame, nifty: pd.DataFrame) -> pd.
     return out.reset_index(drop=True)
 
 
-def apply_sector_alpha_panel(processed_dir: Path) -> None:
+def apply_sector_alpha_panel(processed_dir: Path, cutoff_date: str = None) -> None:
     """
     Cross-sectional step: for each (Date, Sector) cohort, demean Monthly_Alpha by
     sector median so Sector_Alpha measures intra-sector relative strength.
@@ -666,6 +685,12 @@ def apply_sector_alpha_panel(processed_dir: Path) -> None:
         df = df.drop(columns=["Sector_Alpha"], errors="ignore").merge(
             sub, on="Date", how="left"
         )
+        
+        # Clip to cutoff_date if specified
+        if cutoff_date is not None:
+            cutoff_ts = pd.Timestamp(cutoff_date)
+            df = df[df["Date"] <= cutoff_ts].copy()
+        
         df.to_parquet(p, index=False)
 
     print(f"apply_sector_alpha_panel: wrote Sector_Alpha for {len(paths)} feature files.")
@@ -684,10 +709,28 @@ def _safe_stem_from_ticker(ticker: str) -> str:
     )
 
 
-def main() -> None:
+def run_feature_engineering(cutoff_date: str = None) -> None:
+    """
+    Run feature engineering with optional cutoff date for blind splits.
+    
+    Args:
+        cutoff_date: If provided (e.g. "2011-12-31"), creates a blind split
+                   where only rows with Date <= cutoff_date are saved to
+                   data/processed_blind_{YYYYMMDD}/. Forward-looking targets
+                   are computed using data up to cutoff_date + 30 days.
+    """
+    global PROCESSED_DIR
+    
+    # Set output directory based on cutoff_date
+    if cutoff_date is not None:
+        cutoff_YYYYMMDD = cutoff_date.replace("-", "")
+        PROCESSED_DIR = PROJECT_ROOT / "data" / f"processed_blind_{cutoff_YYYYMMDD}"
+        print(f"Running blind feature engineering with cutoff: {cutoff_date}")
+        print(f"Output directory: {PROCESSED_DIR}")
+    
     PROCESSED_DIR.mkdir(parents=True, exist_ok=True)
 
-    bench_path = _download_benchmark_if_missing()
+    bench_path = _download_benchmark_if_missing(cutoff_date)
     equity_paths = list_equity_input_paths(RAW_DIR)
     if not equity_paths:
         raise FileNotFoundError(f"No equity raw files found in: {RAW_DIR}")
@@ -697,11 +740,16 @@ def main() -> None:
 
     for p in equity_paths:
         try:
-            process_raw_equity_path(p, nifty_df, macro_data, PROCESSED_DIR)
+            process_raw_equity_path(p, nifty_df, macro_data, PROCESSED_DIR, cutoff_date)
         except Exception as e:
             print(f"Skipping {p.stem}: unhandled exception ({type(e).__name__}): {e}")
 
-    apply_sector_alpha_panel(PROCESSED_DIR)
+    apply_sector_alpha_panel(PROCESSED_DIR, cutoff_date)
+
+
+def main() -> None:
+    """Legacy main function - runs full feature engineering without cutoff."""
+    run_feature_engineering(cutoff_date=None)
 
 
 if __name__ == "__main__":

@@ -10,12 +10,38 @@ env/
 # Data (too large for git)
 data/raw/*.csv
 data/processed/*.csv
+# Ignore generated datasets/artifacts in these trees (any format)
+data/raw/**
+data/processed/**
+data/universe/**
+# results/ outputs are versioned for dashboards & reproducibility (CSV/JSON; keep sizes reasonable)
+
+# Common heavy ML/data artifacts
+*.parquet
+*.feather
+*.npy
+*.npz
+*.h5
+*.pkl
+*.pickle
+*.joblib
 # results/ outputs are versioned for dashboards & reproducibility (CSV/JSON; keep sizes reasonable)
 
 # Models
 checkpoints/*.pt
 checkpoints/*.joblib
 !checkpoints/.gitkeep
+models/lora_experiment/*.pt
+models/lora_experiment/*.bin
+models/lora_experiment/*.safetensors
+
+# Oversized historical backtest artifact; keep model checkpoints tracked via Git LFS.
+results/backtesting/historical_2012/chronos_v2_adapter_pre2012.pt
+
+# Generated logs/backtest artifacts
+logs/
+archive/logs/
+results/backtesting/**
 
 # Jupyter
 .ipynb_checkpoints/

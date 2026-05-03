@@ -1,0 +1,12 @@
+{
+  "training_samples": 222,
+  "training_start": "2011-02-01",
+  "training_end": "2011-12-30",
+  "regime_mapping": {
+    "0": 2,
+    "1": 0,
+    "2": 1
+  },
+  "mean_return": -0.0007860146887009083,
+  "mean_volatility": 0.013096748556420365
+}

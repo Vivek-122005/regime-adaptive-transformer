@@ -1,0 +1,11 @@
+{
+  "equities_requested": 50,
+  "equities_downloaded_ok": 49,
+  "equities_failed": 1,
+  "failed_equity_tickers": [
+    "TATAMOTORS.NS"
+  ],
+  "failed_equity_errors": {
+    "TATAMOTORS.NS": "yfinance returned empty data for TATAMOTORS.NS"
+  }
+}

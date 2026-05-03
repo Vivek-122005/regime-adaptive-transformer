@@ -1,30 +1,30 @@
 [
     {
-        "CAGR":-0.2868563353,
-        "Sharpe_Net":-6.3518546074,
-        "Max_Drawdown":-0.5216525225,
-        "Win_Rate":0.0,
+        "CAGR":0.0953863747,
+        "Sharpe_Net":0.6302602153,
+        "Max_Drawdown":-0.133761505,
+        "Win_Rate":0.5384615385,
         "Scenario":"Baseline (ML): Momentum + HMM"
     },
     {
-        "CAGR":-0.4196481414,
-        "Sharpe_Net":-9810.380416493,
-        "Max_Drawdown":-0.6947412769,
-        "Win_Rate":0.0,
+        "CAGR":0.2350853967,
+        "Sharpe_Net":1.3435400297,
+        "Max_Drawdown":-0.1601000887,
+        "Win_Rate":0.6153846154,
         "Scenario":"Foundation Only (DL): Chronos-T5 (LoRA)"
     },
     {
-        "CAGR":-0.4161107393,
-        "Sharpe_Net":-531.8717514099,
-        "Max_Drawdown":-0.69066875,
-        "Win_Rate":0.0,
+        "CAGR":0.2284894471,
+        "Sharpe_Net":0.907329986,
+        "Max_Drawdown":-0.1106832452,
+        "Win_Rate":0.5769230769,
         "Scenario":"Simple Hybrid: Momentum + Chronos (50\/50)"
     },
     {
-        "CAGR":-0.2898059119,
-        "Sharpe_Net":-6.2680169477,
-        "Max_Drawdown":-0.5260136451,
-        "Win_Rate":0.0,
+        "CAGR":0.0821631736,
+        "Sharpe_Net":0.5443478671,
+        "Max_Drawdown":-0.1375342052,
+        "Win_Rate":0.5769230769,
         "Scenario":"Triple-Expert (Proposed): Momentum + Chronos + HMM"
     }
 ]
