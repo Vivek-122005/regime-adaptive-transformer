@@ -1,31 +1,23 @@
-# Use an official Python runtime as a parent image
-FROM python:3.14-slim
+# Match requirements.txt: pinned versions (numpy 1.26.4, torch 2.2.2) target Python 3.11.
+FROM python:3.11-slim
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set the working directory in the container
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
+# Build toolchain for any wheels that need to compile (e.g. hmmlearn) plus git for VCS deps.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
-    software-properties-common \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy the requirements file into the container
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip && \
+    pip install --no-cache-dir -r requirements.txt
 
-# Install specific dependencies for Phase 3 Foundation Expert
-RUN pip install --no-cache-dir peft transformers accelerate datasets
-
-# Copy the rest of the application code into the container
 COPY . .
 
 # Expose the port that Streamlit will run on

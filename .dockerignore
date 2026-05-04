@@ -1,0 +1,50 @@
+# Keep the Docker build context small and the resulting image lean.
+
+# VCS / IDE / editor
+.git
+.gitignore
+.gitattributes
+.github
+.idea
+.vscode
+.claude
+
+# Local virtual envs and tool caches
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.ipynb_checkpoints
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Historical / audit artefacts not needed at runtime
+archive
+logs
+report/report.aux
+report/report.log
+report/report.bbl
+report/report.blg
+report/report.out
+report/report.toc
+
+# Heavy raw data: the dashboard reads processed parquet at runtime;
+# raw price feeds are only needed for re-running feature engineering.
+data/raw
+
+# Frontend node modules (if ever populated)
+frontend/node_modules
+
+# Test / scratch
+tests/__pycache__
+*.swp
+*.swo
