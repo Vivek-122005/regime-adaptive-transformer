@@ -12,6 +12,17 @@ This motivates the project's actual architectural claim: **HMM is conditional in
 ![Architecture](docs/architecture_final.png)
 *(Mermaid source in `docs/architecture.md`; SVG export pending — `mmdc` not installed in build env.)*
 
+## Where everything lives — phase view
+
+The repo is organized by **function** at the file-system level (one `models/`, one `dashboard/`, one backtest engine), but the report and the dashboard are organized by **phase**. See **[PHASE_INDEX.md](PHASE_INDEX.md)** for the full per-phase file map.
+
+| Phase | Source code | Results | Dashboard section |
+|---|---|---|---|
+| **Phase 1** — Foundational ML baselines (XGBoost, LSTM daily) | [models/baseline_xgboost.py](models/baseline_xgboost.py), [models/baseline_lstm.py](models/baseline_lstm.py) | [results/backtesting/phase1_baselines/](results/backtesting/phase1_baselines/) | Phase 1 — Foundational ML |
+| **Phase 2** — RAMT custom transformer (failed) | [models/ramt/](models/ramt/), [models/ablation_engine.py](models/ablation_engine.py), [scripts/regenerate_ramt_outputs.py](scripts/regenerate_ramt_outputs.py) | [results/models/ramt/](results/models/ramt/) | Phase 2 — Deep Learning |
+| **Phase 3** — Foundation model + LoRA + hybrid | [models/lora_experiment/](models/lora_experiment/), [scripts/train_chronos_lora.py](scripts/train_chronos_lora.py), [backtest/core/momentum_hmm_strategy.py](backtest/core/momentum_hmm_strategy.py) | [results/models/lora/](results/models/lora/), [results/backtesting/{final_strategy,hybrid_lora,hmm_ablation,historical_2012}/](results/backtesting/), [results/ablation_summary.json](results/ablation_summary.json) | Phase 3 — Hybrid system |
+| Shared infrastructure | [features/](features/), [backtest/core/backtest.py](backtest/core/backtest.py), [data/](data/), [dashboard/app.py](dashboard/app.py), [report/](report/), [docs/](docs/) | n/a | All sections |
+
 ## Quick Start (Turn-Key)
 
 ```bash
