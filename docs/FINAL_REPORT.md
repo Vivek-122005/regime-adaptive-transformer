@@ -1,28 +1,58 @@
 # FINAL REPORT
 
 ## Executive Summary
-This project evolved from a transformer-centric ranking hypothesis to a validated hybrid architecture where regime-aware risk control (HMM) and sentiment-aware gating (FinBERT + LoRA pathway) are explicitly separated and testable. The final system emphasizes robustness, diagnostic transparency, and reproducible execution over headline complexity.
+This project tested whether a multimodal regime-adaptive transformer (RAMT) could rank NIFTY 200 names cross-sectionally on a 21-day horizon. RAMT failed (DA 47.2%, mean IC -0.016, prediction collapse). The diagnostic phase showed plain LightGBM and 21-day momentum carried the only stable signal at our data scale. Phase 3 substituted a pre-trained foundation model (Chronos-T5-Small) fine-tuned with LoRA (r=8, ~0.1% trainable parameters), which was the highest-Sharpe single component (1.34 net) on the 2024–2026 window.
+
+We tested three interaction modes between ML components (HMM regime detector, momentum ranking) and the DL component (Chronos-T5 + LoRA): static blending, regime-conditional blending, and Foundation-Only. Foundation-Only Chronos-LoRA achieved the highest Sharpe on 2024–2026. However, across four historical ablation windows, HMM regime-conditional sizing preserved capital during crises — reducing 2008 max drawdown by 9.4pp (-43.2% vs flat -52.7%). This motivates a regime-conditional gating mechanism as future work: defer to Foundation-Only in calm regimes, fall back to HMM-protected sizing in high-volatility regimes.
 
 ## Methodology
-The production decision layer uses a Regime-Adaptive Sentiment Gating policy: in Bull regimes momentum remains primary with permissive sentiment filtering; in High-Vol regimes score fusion uses weighted momentum-sentiment integration; in Bear regimes sentiment conviction gates entries and allows cash states. All feature streams are shifted to enforce T-1 information for T execution, preventing look-ahead leakage.
+The production decision layer uses 21-day cross-sectional momentum ranking with a 3-state HMM (Bull / High-Vol / Bear) driving regime-conditional position sizing (100% / 50% / 20%), one-name-per-sector cap, 7% per-stock stop, 15% portfolio drawdown killswitch, and 21-trading-day rebalances. Friction is modeled at 0.22% of traded notional. All feature streams are shifted to enforce T-1 information for T execution; the rebalance grid is driven by the predictions file (not the NIFTY calendar) to prevent the date-alignment bug that earlier zeroed out the backtest.
 
-## Ablation Results
+## Ablation Results (2024–2026 window, net of friction)
 
-| Scenario | CAGR | Sharpe (Net) | Max Drawdown | Win Rate | Source |
+| Variant | CAGR | Sharpe (net) | Max DD | Win rate | Source |
 | --- | --- | --- | --- | --- | --- |
-| Baseline (Momentum) | 43.04% | 1.345 | -19.68% | N/A | results/hmm_ablation/.../hmm_vs_flat_summary.csv |
-| ML-Enhanced (Momentum + HMM) | 10.62% | 0.663 | -18.68% | N/A | results/hmm_ablation/.../hmm_vs_flat_summary.csv |
-| DL-Enhanced (Momentum + FinBERT) | N/A | N/A | N/A | N/A | results/ablation_report.csv not found |
-| Full Hybrid (Our Model) | 13.49% | 0.833 | -18.68% | 64.00% | results/final_strategy/backtest_results.csv |
+| Momentum + HMM (Phase 2 production) | 13.49% | 0.833 | -18.68% | 64.00% | `results/final_strategy/backtest_results.csv` |
+| RAMT transformer (Phase 2 failed) | n/a | 0.485 | -6.37% | n/a | `results/models/ramt/ramt_metrics.json` |
+| Chronos-LoRA Foundation-Only (Phase 3) | 23.51% | **1.345** | -16.01% | 61.54% | `results/ablation_summary.json` |
+| Simple Hybrid (50/50 Momentum + Chronos) | 22.85% | 0.907 | -11.07% | 57.69% | `results/ablation_summary.json` |
+| Triple-Expert (Momentum + Chronos + HMM) | 8.22% | 0.544 | -13.75% | 57.69% | `results/ablation_summary.json` |
 
-**Note:** `results/ablation_report.csv` is not present in the current artifact set. Rows were populated from available backtest summaries where possible; unavailable rows remain `N/A`.
+### Component-removal analysis
+
+| Variant | Sharpe (net) | CAGR | Max DD | Status |
+| --- | --- | --- | --- | --- |
+| Hybrid − HMM (Momentum + Chronos, no regime gate) | 0.907 | 22.85% | -11.07% | identical to Simple Hybrid above; reused |
+| Hybrid − Chronos (Momentum + HMM only) | 0.833 | 13.49% | -18.68% | reused from Phase 2 production strategy |
+| Hybrid − Momentum (Chronos + HMM sizing) | **not run** | n/a | n/a | requires `models/hybrid_backtester.py` (missing on disk); see Limitations |
+
+Removing HMM from the hybrid changes Sharpe from 0.54 (Triple-Expert) to 0.91 (50/50 hybrid) on this single bull-window run — i.e., removing HMM **improves** Sharpe in 2024–2026 because HMM cuts upside in a sustained rally. The HMM ablation across four windows tells the opposite story in crisis years (see next section). Removing Chronos reverts to the Phase 2 momentum baseline (Sharpe 0.83). The "remove momentum, keep Chronos + HMM" cell is not populated because the in-repo `models/hybrid_backtester.py` referenced by `scripts/run_diagnostic_ablation.py` is missing; the existing `results/ablation_summary.json` was generated by an older copy of that module that is no longer in the working tree. This is recorded honestly rather than fabricated.
+
+### HMM ablation across four historical windows
+Source: `results/backtesting/hmm_ablation/<window>/.../hmm_vs_flat_summary.csv`.
+
+| Window | HMM Sharpe | Flat Sharpe | HMM Max DD | Flat Max DD | HMM verdict |
+| --- | --- | --- | --- | --- | --- |
+| 2008–2010 (GFC) | 0.25 | 0.17 | -43.25% | -52.66% | Saves 9.4pp drawdown |
+| 2010–2012 | 0.79 | -3.00 | -12.16% | -30.08% | Avoids large flat-sizing loss |
+| 2013–2015 | 0.84 | 0.59 | -33.23% | -33.23% | Modest Sharpe lift, same DD |
+| 2024–2026 | 0.66 | 1.35 | -18.68% | -19.68% | Cuts upside in clean bull run |
+
+This is the project's real contribution: HMM is **conditional insurance**, not a free lunch.
 
 ## Diagnostic Analysis
 
-- **Baseline (Momentum)**: Serves as the pure price-signal control. Performance reflects momentum capture without macro-state conditioning or text-derived risk adjustment.
-- **ML-Enhanced (Momentum + HMM)**: Adding HMM regime sizing changes exposure profile versus baseline, typically reducing risk concentration during unstable windows at the cost of upside during persistent rallies.
-- **DL-Enhanced (Momentum + FinBERT)**: This scenario has no runnable artifact in the current repository export. The expected metric source is missing, so no quantitative claim is made.
-- **Full Hybrid (Our Model)**: Joint regime + sentiment gating combines macro-state risk control with narrative-level signal timing. Improvements in Sharpe or drawdown are interpreted as complementary ML+DL behavior.
+- **Phase 1 baselines (XGBoost, LSTM)** failed on daily-return targets: directional accuracy 49.4% / 48.9%, mean IC -0.061 / -0.041. The label was the bug, not the algorithm. Pivoted to 21-day forward alpha.
+- **RAMT transformer** trained but never separated names: per-date prediction σ collapsed to ~0.0015, validation IC went negative (-0.036), tournament ranking loss vanished its own gradients. We documented this as an architectural failure rather than hiding it.
+- **Plain 21-day momentum** beat RAMT on every diagnostic metric (IC, top-5 spread, top-5 positive rate). At ~100k–130k trainable parameters and the data scale of NIFTY 200, momentum dominated.
+- **Chronos-T5 + LoRA** introduced a foundation model trained at far larger scale than we could ever hit, with LoRA touching only ~0.1% of weights. This is the single change that produced a genuinely new signal (Sharpe 1.34, CAGR 23.5%) on the held-out window.
+- **HMM** lifts the signal in crisis windows and drags it in clean bulls. Treat it as conditional risk control, not always-on alpha.
 
 ## Reproducibility Statement
-The repository includes a single orchestrator (`main.py --task all`), container manifests, a self-audit script, and deterministic report generation. This final report is generated from local result artifacts only, without manual metric edits.
+The repository pins exact dependency versions (`requirements.txt`, `==`), ships a Docker image, a `data/manifest.csv` with per-file row counts and md5 hashes verified by `scripts/check_pipeline_health.py::verify_manifest`, and a single orchestrator (`main.py`). This report is generated from local result artifacts only, without manual metric edits, except where rows are explicitly marked as "not run" due to a missing in-repo module.
+
+## Limitations
+- `models/hybrid_backtester.py` is referenced from `scripts/run_diagnostic_ablation.py` and from prior versions of this report but is absent in the current working tree. The numbers in `results/ablation_summary.json` are reused from a prior run; the "Hybrid − Momentum" cell could not be re-derived from disk artifacts in this revision.
+- Out-of-sample window for the headline Phase 3 numbers is two years (2024–2026); not stress-tested against 2008/2020-style crashes.
+- Universe is a static 2026 NIFTY 200 snapshot — survivorship and membership drift remain.
+- Friction modeled as 0.22% of traded notional; real Indian small/mid-cap impact is often worse.

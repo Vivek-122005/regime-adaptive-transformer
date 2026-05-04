@@ -1,18 +1,16 @@
 # RAMT: Regime-Adaptive Multimodal Transformer
 
-*A 3rd-year capstone on Indian equity alpha. Evolving from simple momentum to a Foundation-Hybrid Triple-Expert System.*
+*A 3rd-year capstone on Indian equity alpha. The research traveled from a transformer-centric ranking hypothesis (RAMT) to a foundation-model fine-tune (Chronos-T5 + LoRA), with an HMM regime detector layered as conditional risk control.*
 
-## Phase 3: Triple-Expert Hybrid System (Exemplary)
+## Headline finding (honest framing)
 
-The project has evolved into a **Foundation-Hybrid** architecture, combining three distinct "Brains" to navigate the NIFTY 200:
+We tested three interaction modes between the ML components (HMM regime detector, 21-day momentum ranking) and the DL component (Chronos-T5 with LoRA adapters): static blending, regime-conditional blending, and Foundation-Only. **Foundation-Only Chronos-LoRA achieved the highest Sharpe (1.34) on the 2024–2026 window**, beating both the simple 50/50 hybrid (Sharpe 0.91) and the regime-gated Triple-Expert (Sharpe 0.54). However, across the four historical ablation windows (2008–2010, 2010–2012, 2013–2015, 2024–2026), **HMM regime-conditional sizing preserved capital during crises — reducing max drawdown by 9.4pp during 2008 (−43.2% vs flat −52.7%) and turning a flat-sizing Sharpe of −3.0 into +0.79 in 2010–2012**. In the 2024–2026 bull window the same gating cut upside (HMM 0.66 vs flat 1.35).
 
-1.  **Technical Expert**: Cross-sectional 21-day momentum (`Ret_21d`).
-2.  **Foundation Expert**: **Chronos-T5** fine-tuned via **LoRA** (Low-Rank Adaptation) on 10 RAMT features.
-3.  **Risk Expert**: **HMM-based** regime detection for dynamic position sizing.
+This motivates the project's actual architectural claim: **HMM is conditional insurance, not always-on alpha.** The natural follow-up is a regime-conditional gate that defers to Foundation-Only in calm regimes and shifts to HMM-protected sizing only in high-volatility / bear regimes. The current production deployment uses Momentum + HMM (Sharpe 0.83, CAGR 13.5% on 2024–2026) because its drawdown profile is the best understood across regimes; Chronos-LoRA Foundation-Only is the best out-of-sample Sharpe in the ablation but has only been validated on a single 2024–2026 window.
 
 ### Architecture
-![Triple-Expert Architecture](docs/triple_expert_architecture.png)
-*(Generated reproducibly; see `docs/architecture.md` for Mermaid source)*
+![Architecture](docs/architecture_final.png)
+*(Mermaid source in `docs/architecture.md`; SVG export pending — `mmdc` not installed in build env.)*
 
 ## Quick Start (Turn-Key)
 
@@ -58,17 +56,29 @@ docker build -t ramt-phase3 .
 docker run -p 8501:8501 ramt-phase3
 ```
 
-## Rubric Alignment (Phase 3)
+## Ablation summary (2024–2026 window, net of 0.22% friction)
 
-| Rubric Category | Level 5 Evidence File(s) |
+| Variant | Sharpe (net) | CAGR | Max DD | Notes |
+| --- | --- | --- | --- | --- |
+| Momentum + HMM (Phase 2 production) | 0.83 | 13.5% | -18.7% | `results/final_strategy/backtest_results.csv` |
+| RAMT transformer (Phase 2, failed) | 0.49 | n/a | -6.4% | `results/models/ramt/ramt_metrics.json` |
+| Chronos-LoRA Foundation-Only (Phase 3) | **1.34** | 23.5% | -16.0% | `results/ablation_summary.json` |
+| Simple Hybrid (50/50 Momentum + Chronos) | 0.91 | 22.8% | -11.1% | `results/ablation_summary.json` |
+| Triple-Expert (Momentum + Chronos + HMM, regime-gated) | 0.54 | 8.2% | -13.8% | `results/ablation_summary.json` |
+
+Across the four HMM ablation windows (2008, 2010, 2013, 2024) the HMM gating story is regime-dependent: it dominates in volatile/bear windows and underperforms in clean bull markets. See `results/backtesting/hmm_ablation/` for per-window summaries.
+
+## Rubric alignment
+
+| Rubric category | Evidence |
 | --- | --- |
-| **Architecture Diagram (Publication-Ready)** | [architecture.md](docs/architecture.md), [architecture_final.png](docs/architecture_final.png) |
-| **Hybrid Methodology (Outstanding)** | [hybrid_backtester.py](models/hybrid_backtester.py), [chronos_lora_v2.py](models/lora_experiment/chronos_lora_v2.py) |
-| **Ablation Studies (Diagnostic)** | [run_diagnostic_ablation.py](scripts/run_diagnostic_ablation.py), [ablation_summary.json](results/ablation_summary.json) |
-| **Explainability (Extra Mile)** | [explain_chronos.py](scripts/explain_chronos.py), [chronos_feature_importance.json](results/explainability/chronos_feature_importance.json) |
-| **Interactive Visualization (Extra Mile)** | [app.py](dashboard/app.py) (Triple-Expert Diagnostic section) |
-| **Reproducibility (Turn-Key)** | [main.py](main.py), [Dockerfile](Dockerfile), [setup.sh](setup.sh) |
-| **Data Integrity / Leakage Controls** | [check_pipeline_health.py](scripts/check_pipeline_health.py), [hybrid_backtester.py](models/hybrid_backtester.py) |
+| Architecture diagram | [docs/architecture.md](docs/architecture.md), [docs/architecture_final.png](docs/architecture_final.png) |
+| Hybrid methodology | [models/lora_experiment/chronos_lora_v2.py](models/lora_experiment/chronos_lora_v2.py), `scripts/run_diagnostic_ablation.py`, `results/ablation_summary.json` |
+| Ablation studies | [scripts/run_diagnostic_ablation.py](scripts/run_diagnostic_ablation.py), [results/ablation_summary.json](results/ablation_summary.json), [results/backtesting/hmm_ablation/](results/backtesting/hmm_ablation/) (4 windows) |
+| Explainability | [scripts/explain_chronos.py](scripts/explain_chronos.py), `results/models/explainability/feature_importance_plot.png` |
+| Interactive visualization | [dashboard/app.py](dashboard/app.py) |
+| Reproducibility | [main.py](main.py), [Dockerfile](Dockerfile), [setup.sh](setup.sh), [data/manifest.csv](data/manifest.csv), [requirements.txt](requirements.txt) (pinned) |
+| IEEE write-up | [report/report.tex](report/report.tex) |
 
 ## The goal
 
