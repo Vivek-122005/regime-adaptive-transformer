@@ -123,9 +123,9 @@ HIGH_VOL_SAMPLE_WEIGHT = 2.0  # regime 0
 # MarginRankingLoss margin: higher → model must separate leaders from the pack more aggressively.
 RANKING_MARGIN = 3.0
 
-# --- Pessimism-bias fix (plan: eager-rolling-sphinx) -----------------------
-# See /Users/shivanshgupta/.claude/plans/eager-rolling-sphinx.md for the
-# mathematical defect summary that motivated these knobs.
+# --- Pessimism-bias fix --------------------------------------------------
+# Tournament ranking knobs that mitigate the prediction-collapse failure
+# mode described in docs/RAMT_CORE_AUDIT.md.
 USE_TOURNAMENT_LOSS = True            # magnitude-weighted pairwise ranking (see losses.TournamentRankingLoss)
 # Margin in unscaled monthly-alpha units (winsorized % space); paired with inverse-scaled preds.
 RANKING_MARGIN_ALPHA = 0.02
