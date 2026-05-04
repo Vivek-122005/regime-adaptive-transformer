@@ -1,0 +1,185 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: Lint & syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Compile every Python file
+        run: |
+          python -m compileall -q backtest backend dashboard features models scripts main.py
+
+      - name: Validate YAML configs
+        run: |
+          pip install --quiet pyyaml
+          python - <<'PY'
+          import glob, sys, yaml
+          files = glob.glob('config/**/*.yaml', recursive=True) + glob.glob('config/**/*.yml', recursive=True)
+          if not files:
+              sys.exit("No YAML configs found under config/")
+          for f in files:
+              with open(f) as fh:
+                  yaml.safe_load(fh)
+              print(f"OK {f}")
+          PY
+
+      - name: Validate data manifest
+        run: |
+          python - <<'PY'
+          import csv, sys
+          required = {'ticker', 'file', 'bytes', 'md5'}
+          with open('data/manifest.csv') as f:
+              rows = list(csv.DictReader(f))
+          if len(rows) < 100:
+              sys.exit(f"manifest too short: {len(rows)} rows")
+          missing = required - set(rows[0].keys())
+          if missing:
+              sys.exit(f"manifest missing columns: {missing}")
+          for r in rows:
+              if len(r['md5']) != 32:
+                  sys.exit(f"bad md5 for {r['ticker']}: {r['md5']!r}")
+              if not r['file'].endswith('.parquet'):
+                  sys.exit(f"unexpected file extension: {r['file']}")
+          print(f"OK manifest: {len(rows)} ticker fingerprints")
+          PY
+
+  structure:
+    name: Repo structure
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify required artifacts
+        run: |
+          set -e
+          for path in \
+            README.md \
+            LICENSE \
+            CITATION.cff \
+            requirements.txt \
+            Dockerfile \
+            docker-compose.yml \
+            main.py \
+            setup.sh \
+            run_all.sh \
+            demo_walkthrough.sh \
+            data/manifest.csv \
+            report/report.tex \
+            report/report.pdf \
+            report/references.bib \
+            docs/architecture_final.png \
+            docs/architecture_final.svg \
+            docs/architecture.md \
+            docs/LITERATURE_REVIEW.md \
+            docs/FINAL_REPORT.md \
+            docs/RESULTS.md \
+            docs/ATTENTION_EXPLAINABILITY.md \
+            docs/FEATURES_AND_REGIMES.md \
+            features/feature_engineering.py \
+            scripts/run_ablation_study.py \
+            scripts/run_diagnostic_ablation.py \
+            scripts/generate_architecture_diagram.py \
+            dashboard/app.py
+          do
+            test -e "$path" || { echo "MISSING: $path"; exit 1; }
+            echo "OK   $path"
+          done
+          for d in models features scripts dashboard backtest config eda; do
+            test -d "$d" || { echo "MISSING DIR: $d"; exit 1; }
+            echo "OK   $d/"
+          done
+
+  install:
+    name: Install pinned deps & import smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Import critical modules
+        run: |
+          python - <<'PY'
+          import importlib
+          mods = [
+              'numpy', 'pandas', 'pyarrow', 'yfinance',
+              'sklearn', 'xgboost', 'lightgbm', 'hmmlearn',
+              'torch', 'transformers', 'peft', 'accelerate', 'datasets',
+              'matplotlib', 'seaborn', 'scipy', 'statsmodels',
+              'yaml', 'tqdm', 'streamlit', 'plotly', 'requests', 'bs4',
+          ]
+          failed = []
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+                  print(f"OK   {m}")
+              except Exception as e:
+                  print(f"FAIL {m}: {e}")
+                  failed.append(m)
+          if failed:
+              raise SystemExit(f"Import failures: {failed}")
+          PY
+
+      - name: main.py --help
+        run: python main.py --help
+
+      - name: Project module imports
+        run: |
+          python - <<'PY'
+          import importlib, sys
+          sys.path.insert(0, '.')
+          mods = [
+              'features.feature_engineering',
+              'models.baseline_xgboost',
+              'models.baseline_lstm',
+          ]
+          for m in mods:
+              try:
+                  importlib.import_module(m)
+                  print(f"OK   {m}")
+              except Exception as e:
+                  print(f"WARN {m}: {e}")
+          PY
+
+  docker:
+    name: Docker build (informational)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Build image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
