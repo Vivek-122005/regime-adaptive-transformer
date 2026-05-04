@@ -312,9 +312,13 @@ Sidebar → **Phase 3 — Hybrid system** → Overview (architecture + equity ov
 ### Reporting & deliverables
 | File | Purpose |
 |---|---|
-| [report/report.tex](report/report.tex) | IEEE LaTeX paper (10 pages) |
-| [report/report.pdf](report/report.pdf) | Compiled paper |
+| [report/report.tex](report/report.tex) | **Canonical IEEE LaTeX paper** (10 pages, covers all phases) |
+| [report/report.pdf](report/report.pdf) | Compiled canonical paper |
 | [report/references.bib](report/references.bib) | Bibliography |
+| [report/phase1/Phase1_PPT.pdf](report/phase1/Phase1_PPT.pdf) | Phase 1 presentation deck |
+| [report/phase2/Phase2_Report.pdf](report/phase2/Phase2_Report.pdf) | Phase 2 standalone report |
+| [report/phase3/Phase3_PPT.pdf](report/phase3/Phase3_PPT.pdf) | Phase 3 presentation deck |
+| [report/phase3/Phase3_Report.pdf](report/phase3/Phase3_Report.pdf) | Phase 3 standalone report |
 | [LICENSE](LICENSE) | License |
 | [CITATION.cff](CITATION.cff) | Citation metadata |
 
