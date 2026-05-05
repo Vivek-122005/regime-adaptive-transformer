@@ -1,0 +1,353 @@
+\documentclass[conference]{IEEEtran}
+\IEEEoverridecommandlockouts
+
+\usepackage{cite}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{algorithmic}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{url}
+\usepackage{hyperref}
+
+\def\BibTeX{{\rm B\kern-.05em{\sc i\kern-.025em b}\kern-.08em
+    T\kern-.1667em\lower.7ex\hbox{E}\kern-.125emX}}
+
+\begin{document}
+
+\title{Regime-Adaptive Multimodal Transformer for
+Cross-Market Equity Forecasting}
+
+\author{\IEEEauthorblockN{Vivek (230119)}
+\IEEEauthorblockA{\textit{B.Tech in Computer Science and Artificial Intelligence} \\
+\textit{Rishihood University}\\
+Sonipat, India \\
+vivek.23csai@nst.rishihood.edu.in}
+\and
+\IEEEauthorblockN{Shivansh (230054)}
+\IEEEauthorblockA{\textit{B.Tech in Computer Science and Artificial Intelligence} \\
+\textit{Rishihood University}\\
+Sonipat, India \\
+shivansh.g23csai@nst.rishihood.edu.in}
+}
+\maketitle
+
+\begin{abstract}
+We test whether a regime-adaptive multimodal transformer (RAMT) can rank NIFTY~200
+constituents cross-sectionally on a 21-day horizon. RAMT fails: predictions collapse
+($\sigma \approx 0.0015$ across names), validation IC turns negative, and a
+60-line LightGBM diagnostic on the same features produces $\mathrm{IC}=+0.021$.
+We replace RAMT with two alternatives: (a)~plain 21-day momentum gated by a 3-state
+Hidden Markov Model on the index, and (b)~Chronos-T5-Small fine-tuned with LoRA
+($r{=}8$) on the same 10 features. Across the 2024--2026 out-of-sample window,
+Foundation-Only Chronos-LoRA delivers Sharpe $1.34$, the strongest single component;
+Momentum$+$HMM delivers Sharpe $0.83$ with a more conservative drawdown profile;
+the regime-gated Triple-Expert hybrid \emph{underperforms} both at Sharpe $0.54$.
+Across four historical HMM ablation windows (2008--2010, 2010--2012, 2013--2015,
+2024--2026) the regime gate saves $9.4$pp of drawdown in the 2008 crisis and
+turns a Sharpe of $-3.0$ into $+0.79$ in 2010--2012 but caps upside in clean bulls.
+Our three findings: (1)~simpler architectures beat deeper ones at sub-million-parameter
+scales on this universe; (2)~the RAMT failure is architectural, not a feature
+problem (LightGBM and momentum found signal on the same panel); (3)~the HMM is
+\emph{conditional insurance}, not always-on alpha.
+\end{abstract}
+
+\begin{IEEEkeywords}
+quantitative finance, factor investing, hidden markov models, foundation models,
+LoRA, Chronos-T5, regime detection, NIFTY 200, ablation
+\end{IEEEkeywords}
+
+% --------------------------------------------------------------------
+\section{Introduction}
+% --------------------------------------------------------------------
+The original hypothesis of this project was that a multimodal transformer with
+explicit regime cross-attention and a tournament ranking loss would extract
+cross-sectional alpha from NIFTY~200 names that simpler factor models miss. The
+hypothesis is rejected by the data. After two attempts at training the
+transformer (RAMT) we observed prediction-variance collapse and negative
+validation IC. A diagnostic with plain LightGBM on the same ten features
+produced statistically meaningful information coefficient, ruling out feature
+adequacy as the cause. The remainder of the project tests two simpler
+alternatives and a foundation-model fine-tune.
+
+The contribution of this paper is empirical: we report a complete ablation
+across one ML-only baseline (Momentum$+$HMM), one transformer-from-scratch
+attempt (RAMT), one foundation-model fine-tune (Chronos-T5-Small with LoRA
+adapters), and two interaction modes between them, on the same 2024--2026
+out-of-sample window with identical friction and risk-control rules. We then
+report a separate four-window study isolating HMM regime sizing against flat
+sizing.
+
+% --------------------------------------------------------------------
+\section{Related Work}
+% --------------------------------------------------------------------
+Cross-sectional momentum on equities was established by Jegadeesh and
+Titman~\cite{jegadeesh1993} and refined into the global ``everywhere''
+formulation by Asness, Moskowitz, and Pedersen~\cite{asness2013}. Hidden Markov
+Models for regime detection follow Hamilton's regime-switching framework~\cite{hamilton1989},
+extended to multivariate financial settings by Guidolin and
+Timmermann~\cite{guidolin2007}. Transformer architectures originate from
+Vaswani et al.~\cite{vaswani2017} and were specialized for time-series
+forecasting in Lim et al.~\cite{lim2021}'s Temporal Fusion Transformer. Our
+Phase~3 substitutes a pre-trained foundation model: Chronos~\cite{chronos2023}
+treats time-series tokenization with the T5 architecture, and we adapt it
+parameter-efficiently using LoRA~\cite{lora2021}, which constrains updates
+to low-rank decompositions $W = W_0 + BA$ with $B \in \mathbb{R}^{d \times r}$,
+$A \in \mathbb{R}^{r \times k}$, $r \ll \min(d,k)$.
+
+% --------------------------------------------------------------------
+\section{Data and Features}
+% --------------------------------------------------------------------
+\textbf{Universe.} A static 2026 NIFTY~200 snapshot. We acknowledge survivorship
+and constituent-drift bias as a limitation rather than a fix.
+
+\textbf{Sources.} Daily OHLCV per ticker via \texttt{yfinance}; index series for
+\texttt{\^{}NSEI} for the regime feed and benchmark; sector mapping is a hand-curated
+table in \texttt{features/sectors.py}.
+
+\textbf{Features (10).} Per ticker per date, lagged at $T{-}1$ to enforce
+information frontiers: 21-day return (\texttt{Ret\_21d}), 5-day return,
+realized volatility (21-day), volume z-score, price relative to 50-day SMA,
+price relative to 200-day SMA, 14-day RSI, MACD histogram, NIFTY 21-day return
+(macro feed), NIFTY realized volatility (macro feed). The label is 21-day
+forward sector-neutral alpha (\texttt{Sector\_Alpha}).
+
+\textbf{Modalities (4).} Price, technicals, volume, macro. The HMM is fit on the
+NIFTY index alone (3-state Gaussian, fit by Baum--Welch).
+
+\textbf{Manifest.} \texttt{data/manifest.csv} ships 201 parquet entries with
+md5 hashes; \texttt{scripts/check\_pipeline\_health.py --verify-manifest}
+re-hashes them on demand for reproducibility.
+
+% --------------------------------------------------------------------
+\section{Phase~1: Baseline Models}
+% --------------------------------------------------------------------
+We first tested daily-return prediction with XGBoost and an LSTM. Both failed:
+directional accuracy 49.4\% (XGBoost) and 48.9\% (LSTM) on the walk-forward
+test set; mean information coefficient $-0.061$ and $-0.041$ respectively
+(\texttt{results/backtesting/phase1\_baselines/}). The label was the bug, not
+the algorithm: daily returns at this granularity are dominated by noise. We
+pivoted to 21-day forward sector-neutral alpha for Phases~2 and~3.
+
+% --------------------------------------------------------------------
+\section{Phase~2: RAMT Architecture and Failure}
+% --------------------------------------------------------------------
+\subsection{Architecture}
+RAMT comprises six modules:
+(1)~a \texttt{MultimodalEncoder} for the four modalities;
+(2)~standard sinusoidal positional encoding;
+(3)~\texttt{RegimeCrossAttention}, where the regime embedding is the query;
+(4)~a 3-expert MoE block (bull, high-vol, bear flavor) followed by transformer layers;
+(5)~dual prediction heads for monthly and daily horizons; and
+(6)~a tournament ranking loss with an auxiliary daily MSE anchor.
+
+\subsection{Training Setup}
+Walk-forward, 6-month refresh, sequence length 30. After speed and
+overfitting fixes (workers $=4$, cache $=250$, MoE collapsed to a single
+expert), the final architecture has 131{,}298 parameters across 2~transformer
+layers and 8~heads.
+
+\subsection{Failure Analysis}
+Across 25~epochs and four walk-forward folds, validation correlation to
+\texttt{Sector\_Alpha} went \emph{negative} ($-0.036$) and worsened
+monotonically. Per-date prediction standard deviation across the 200 names
+collapsed to $\sigma \approx 0.0015$. The mechanism: the tournament ranking
+loss has a fixed-point at zero scores --- once predictions collapse, pairwise
+margins vanish, gradients vanish, and the model has no signal to escape. We
+later raised the daily-MSE anchor weight from 0.05 to 0.20, restored capacity
+to 131k parameters, and re-ran 7~epochs; the negative-correlation curve was
+already monotonic and we stopped.
+
+Final RAMT metrics on the blind 2024--2026 window:
+$\mathrm{DA}=47.2\%$, $\mathrm{RMSE}=0.072$, $\mathrm{mean\ IC}=-0.016$,
+backtested $\mathrm{Sharpe}=0.485$, $\mathrm{MaxDD}=-6.4\%$
+(\texttt{results/models/ramt/ramt\_metrics.json}).
+
+\subsection{Diagnostic that motivated the pivot}
+A 60-line LightGBM script on the same 10 features and the same train/test
+split produced $\mathrm{IC}=+0.021$, $\mathrm{IR}=+6.41$, top-5 positive-alpha
+rate $53.8\%$. Pure 21-day momentum without any model produced
+$\mathrm{IC}=+0.0065$, top-5 spread $+1.59\%$ per month, top-5 positive rate
+$56.3\%$. Both beat RAMT. The features carried signal; the transformer did not
+extract it.
+
+% --------------------------------------------------------------------
+\section{Phase~3: Foundation Model with LoRA}
+% --------------------------------------------------------------------
+\subsection{Architecture}
+We freeze the pre-trained Chronos-T5-Small backbone (${\sim}190\mathrm{M}$
+parameters) and attach LoRA adapters with rank $r{=}8$ to the attention
+projection matrices, training only the adapters and a small ranking head ---
+together approximately $0.1\%$ of the backbone's parameter count. Input is the
+same $(B, 30, 10)$ feature tensor used by RAMT. Output is a scalar alpha score
+per ticker per rebalance date.
+
+\subsection{Training Setup}
+LoRA $r{=}8$, $\alpha{=}16$, dropout $0.1$. Optimizer AdamW, learning rate
+$1\mathrm{e}{-4}$, batch size 64, walk-forward training. Reference scripts:
+\texttt{models/lora\_experiment/chronos\_lora\_v2.py},
+\texttt{scripts/train\_chronos\_lora.py}. The trained adapter is committed to
+\texttt{results/models/lora/chronos\_lora\_adapter.pt}.
+
+\subsection{Results}
+Out-of-sample directional accuracy $\mathrm{DA}=47.5\%$ (LoRA v1) /
+$47.0\%$ (LoRA v2), but mean IC turns positive
+($+0.0090$ / $+0.0022$) --- a sign change relative to RAMT. More importantly,
+prediction standard deviation no longer collapses
+($\sigma_{\mathrm{pred}} \approx 4.7\mathrm{e}{-3}$ for LoRA versus
+${\sim}1.5\mathrm{e}{-3}$ for RAMT, a ${\sim}3\times$ widening that allows
+ranking to actually separate names). Backtested Sharpe on 2024--2026 reaches
+$1.34$ (Foundation-Only), the strongest single-component result in the
+project. See Table~\ref{tab:ablation}.
+
+% --------------------------------------------------------------------
+\section{Final Strategy: Momentum + HMM + Sector Cap}
+% --------------------------------------------------------------------
+The currently-deployed strategy is intentionally simpler than the ablation
+winner. Each rebalance date (every 21 trading days):
+\begin{enumerate}
+\item Sort the 200 names by 21-day return.
+\item Take top 5 with at most one name per NSE sector.
+\item Size the book by the current HMM regime: 100\% / 50\% / 20\%
+      for Bull / High-Vol / Bear.
+\item Apply per-stock 7\% stop and a 15\% portfolio drawdown killswitch.
+\item Charge friction at 0.22\% of traded notional.
+\end{enumerate}
+Out-of-sample (\texttt{2024-01-10} to \texttt{2026-01-27}, 2-year window):
+$\mathrm{Sharpe} = 0.83$, $\mathrm{CAGR} = 13.5\%$,
+$\mathrm{MaxDD} = -18.7\%$, win rate $64\%$. Versus NIFTY buy-and-hold over
+the same calendar (Sharpe $0.65$, CAGR $7.7\%$, MaxDD $-15.8\%$): $+0.18$
+Sharpe, $+5.8$pp CAGR, $-2.9$pp on max drawdown.
+
+% --------------------------------------------------------------------
+\section{Ablation}
+% --------------------------------------------------------------------
+
+\subsection{Cross-component ablation (2024--2026 window)}
+\begin{table}[ht]
+\centering
+\caption{Net-of-friction performance on the 2024--2026 out-of-sample window.}
+\label{tab:ablation}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lccc}
+\toprule
+\textbf{Variant} & \textbf{Sharpe} & \textbf{CAGR} & \textbf{MaxDD} \\
+\midrule
+Momentum + HMM (production)            & 0.83 & 13.5\% & -18.7\% \\
+RAMT transformer                       & 0.49 & n/a    & -6.4\%  \\
+Chronos-LoRA Foundation-Only           & \textbf{1.34} & 23.5\% & -16.0\% \\
+Simple Hybrid (50/50 Mom + Chronos)    & 0.91 & 22.8\% & -11.1\% \\
+Triple-Expert (Mom + Chronos + HMM)    & 0.54 & 8.2\%  & -13.8\% \\
+\midrule
+\multicolumn{4}{l}{\emph{Component-removal cells:}} \\
+Hybrid $-$ HMM (alias of Simple Hybrid)    & 0.91 & 22.8\% & -11.1\% \\
+Hybrid $-$ Chronos (alias of Mom+HMM prod) & 0.83 & 13.5\% & -18.7\% \\
+Hybrid $-$ Momentum                        & \multicolumn{3}{c}{not run --- module missing} \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The two interpretable component-removal cells are aliases of existing
+scenarios because, by construction, removing HMM from the Triple-Expert
+collapses to the 50/50 hybrid, and removing Chronos collapses to
+Momentum$+$HMM. The third cell (Chronos$+$HMM, no momentum) is honestly
+recorded as \emph{not run}: the in-repo \texttt{models/hybrid\_backtester.py}
+module referenced from \texttt{scripts/run\_diagnostic\_ablation.py} is absent
+in the current working tree, and we chose not to fabricate a number for the
+table.
+
+\subsection{HMM regime-sizing ablation across four historical windows}
+
+\begin{table}[ht]
+\centering
+\caption{HMM-conditioned vs flat sizing, four windows.}
+\label{tab:hmm}
+\resizebox{\columnwidth}{!}{%
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Window} & \textbf{HMM Sharpe} & \textbf{Flat Sharpe} & \textbf{HMM DD} & \textbf{Flat DD} \\
+\midrule
+2008--2010 (GFC)   & 0.25 & 0.17  & -43.2\% & -52.7\% \\
+2010--2012         & 0.79 & -3.00 & -12.2\% & -30.1\% \\
+2013--2015         & 0.84 & 0.59  & -33.2\% & -33.2\% \\
+2024--2026 (bull)  & 0.66 & 1.35  & -18.7\% & -19.7\% \\
+\bottomrule
+\end{tabular}
+}
+\end{table}
+
+The pattern is consistent across four windows: HMM gating helps in volatile
+and crisis windows (saves 9.4pp drawdown in 2008, rescues a $-3.0$ Sharpe in
+2010--2012) and \emph{hurts} in clean bull markets (cuts Sharpe from $1.35$ to
+$0.66$ in 2024--2026). Treating HMM as conditional insurance rather than
+always-on alpha is the central architectural lesson of the project.
+
+% --------------------------------------------------------------------
+\section{Limitations}
+% --------------------------------------------------------------------
+\textbf{Survivorship bias.} The universe is a 2026 NIFTY~200 snapshot, not the
+historically reconstructed index membership. Although the panel is
+time-aligned, the cross-section excludes names that were in the index but
+later delisted.
+
+\textbf{Window length.} The headline 2024--2026 Phase~3 numbers are from a
+single two-year out-of-sample window. The strategy has not been tested
+through a 2008-style or 2020-style crash in this configuration; the
+four-window HMM study is the closest stress test.
+
+\textbf{Stop-loss is a no-op in places.} The 7\% per-stock stop and 15\%
+portfolio killswitch were rarely triggered in the 2024--2026 window, so the
+backtest does not strongly exercise that path.
+
+\textbf{Friction model.} Costs are modeled as a fixed 0.22\% of traded
+notional per rebalance. Real Indian small/mid-cap impact is often higher and
+varies with name and size; this is a known optimistic bound.
+
+\textbf{Static feature set.} We did not search over feature subsets or
+include text/sentiment features in the final ablation, although a FinBERT
+sentiment pathway exists in the repository.
+
+\textbf{Incomplete component-removal ablation.}
+The Hybrid $-$ Momentum ablation cell, which would isolate the contribution
+of Chronos-LoRA predictions without the momentum ranking signal, could not
+be computed at submission time due to a missing backtesting module
+dependency. This cell is recorded as \texttt{not\_run} in the ablation
+summary JSON and represents an open validation gap. All other
+component-removal cells are populated from real experimental artifacts.
+
+% --------------------------------------------------------------------
+\section{Conclusion}
+% --------------------------------------------------------------------
+Three findings:
+
+\emph{Simpler beat deeper.} At our data and parameter scale, plain 21-day
+momentum outperformed a 131k-parameter regime-aware transformer trained
+end-to-end. Foundation-Only Chronos-LoRA, which leans on a 190M-parameter
+pre-trained backbone with only ${\sim}0.1\%$ trainable, then beat both. The
+inflection happened at the foundation-model boundary, not by adding
+architectural complexity to the from-scratch model.
+
+\emph{The RAMT failure was architectural.} The same 10 features driven into
+LightGBM produced positive IC; driven into 21-day momentum produced positive
+top-5 spread. The transformer's tournament ranking loss collapsed to a
+fixed-point and the gradients went to zero. We document this honestly rather
+than masking it with longer training.
+
+\emph{HMM is conditional insurance.} Across four historical windows the HMM
+regime gate adds Sharpe and reduces drawdown in crisis and high-volatility
+windows, and subtracts Sharpe in clean bulls. The honest deployment policy is
+to gate \emph{only} during volatile regimes; using HMM as an always-on
+multiplier is what produced the Triple-Expert Sharpe of 0.54.
+
+The natural next step is a learned regime-conditional gate that defers to
+Foundation-Only in calm regimes and to HMM-protected sizing in volatile ones,
+with the gate trained on regime-conditional out-of-sample Sharpe rather than
+hand-tuned weights.
+
+% --------------------------------------------------------------------
+\bibliographystyle{IEEEtran}
+\bibliography{references}
+
+\end{document}
